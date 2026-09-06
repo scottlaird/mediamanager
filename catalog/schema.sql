@@ -34,13 +34,14 @@ CREATE TABLE IF NOT EXISTS copies (
 );
 CREATE INDEX IF NOT EXISTS copies_by_location ON copies (location_id, state);
 
-CREATE TABLE IF NOT EXISTS proxies (
+CREATE TABLE IF NOT EXISTS companions (
     asset_id    TEXT    NOT NULL REFERENCES assets(id),
     location_id INTEGER NOT NULL REFERENCES locations(id),
-    relpath     TEXT    NOT NULL,
+    role        TEXT    NOT NULL CHECK (role IN ('proxy', 'sidecar', 'proxy-sidecar')),
     ext         TEXT    NOT NULL,
+    relpath     TEXT    NOT NULL,
     sha256      TEXT    NOT NULL DEFAULT '',
-    PRIMARY KEY (asset_id, location_id, ext)
+    PRIMARY KEY (asset_id, location_id, role, ext)
 );
 
 CREATE TABLE IF NOT EXISTS source_files (

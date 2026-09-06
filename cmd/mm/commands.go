@@ -69,8 +69,8 @@ func printSummary(w io.Writer, src string, s *ingest.Summary) {
 	for _, rel := range s.Source.Unrouted {
 		fmt.Fprintf(w, "  skipped (no tree for its kind): %s\n", rel)
 	}
-	for _, rel := range s.Source.OrphanProxies {
-		fmt.Fprintf(w, "  proxy without an original: %s\n", rel)
+	for _, rel := range s.Source.Orphans {
+		fmt.Fprintf(w, "  proxy or sidecar without an original: %s\n", rel)
 	}
 	if len(s.Source.Unrecognised) > 0 {
 		fmt.Fprintf(w, "  %d unrecognised files ignored\n", len(s.Source.Unrecognised))

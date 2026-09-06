@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -74,12 +75,12 @@ func (e *Env) Reconcile(ctx context.Context, ps []place) (ReconcileReport, error
 					continue
 				}
 				want[a.RelPath] = target
-				proxies, err := e.Catalog.Proxies(ctx, a.ID)
+				comps, err := e.Catalog.Companions(ctx, a.ID)
 				if err != nil {
 					return rep, err
 				}
-				for ext, target := range bestProxies(proxies, locByID, rootOf) {
-					want[naming.ProxyPath(a.RelPath, ext)] = target
+				for key, target := range bestCompanions(comps, locByID, rootOf) {
+					want[companionPath(a.RelPath, key.role, key.ext)] = target
 				}
 			}
 		}
@@ -92,9 +93,28 @@ func (e *Env) Reconcile(ctx context.Context, ps []place) (ReconcileReport, error
 	return rep, nil
 }
 
-// bestProxies picks, per extension, the proxy on the best mounted location
-// in the same spool, NAS, source order the catalog uses for copies.
-func bestProxies(proxies []catalog.Proxy, locByID map[int64]catalog.Location, rootOf func(catalog.Location) (string, bool)) map[string]string {
+// companionKey identifies one companion of an asset across locations.
+type companionKey struct {
+	role catalog.Role
+	ext  string
+}
+
+// companionPath is where a companion of the original at rel belongs.
+func companionPath(rel string, role catalog.Role, ext string) string {
+	switch role {
+	case catalog.RoleSidecar:
+		return naming.SidecarPath(rel)
+	case catalog.RoleProxySidecar:
+		return naming.ProxySidecarPath(rel)
+	default:
+		return naming.ProxyPath(rel, ext)
+	}
+}
+
+// bestCompanions picks, per role and extension, the companion on the best
+// mounted location in the same spool, NAS, source order the catalog uses
+// for copies.
+func bestCompanions(comps []catalog.Companion, locByID map[int64]catalog.Location, rootOf func(catalog.Location) (string, bool)) map[companionKey]string {
 	rank := func(k catalog.LocationKind) int {
 		switch k {
 		case catalog.Spool:
@@ -104,20 +124,21 @@ func bestProxies(proxies []catalog.Proxy, locByID map[int64]catalog.Location, ro
 		}
 		return 2
 	}
-	sort.SliceStable(proxies, func(i, j int) bool {
-		li, lj := locByID[proxies[i].LocationID], locByID[proxies[j].LocationID]
+	sort.SliceStable(comps, func(i, j int) bool {
+		li, lj := locByID[comps[i].LocationID], locByID[comps[j].LocationID]
 		if rank(li.Kind) != rank(lj.Kind) {
 			return rank(li.Kind) < rank(lj.Kind)
 		}
 		return li.Priority < lj.Priority
 	})
-	out := map[string]string{}
-	for _, p := range proxies {
-		if _, done := out[p.Ext]; done {
+	out := map[companionKey]string{}
+	for _, c := range comps {
+		k := companionKey{c.Role, c.Ext}
+		if _, done := out[k]; done {
 			continue
 		}
-		if root, ok := rootOf(locByID[p.LocationID]); ok {
-			out[p.Ext] = abs(root, p.RelPath)
+		if root, ok := rootOf(locByID[c.LocationID]); ok {
+			out[k] = abs(root, c.RelPath)
 		}
 	}
 	return out
@@ -188,7 +209,9 @@ func (e *Env) Archive(ctx context.Context, ps []place, assetID string) ([]CopyRe
 			continue
 		}
 		if hasComplete(copies, p.cat.ID) {
-			results = append(results, CopyResult{AssetID: assetID, Location: p.cat.Name, Skipped: true})
+			// The original never changes, but sidecars do: keep the NAS copy current.
+			n := e.syncCompanions(ctx, a, rootOf, p, true)
+			results = append(results, CopyResult{AssetID: assetID, Location: p.cat.Name, Skipped: true, Proxies: n})
 			continue
 		}
 		select {
@@ -272,18 +295,21 @@ func (e *Env) copyTo(ctx context.Context, ps []place, a catalog.Asset, copies []
 			return CopyResult{}, err
 		}
 	}
-	n := e.copyProxies(ctx, a, rootOf, dest)
+	n := e.syncCompanions(ctx, a, rootOf, dest, false)
 	if _, err := e.Reconcile(ctx, ps); err != nil {
 		return CopyResult{}, err
 	}
 	return CopyResult{AssetID: a.ID, Location: dest.cat.Name, Bytes: res.Size, Resumed: res.Resumed, Proxies: n}, nil
 }
 
-// copyProxies brings the asset's proxies along to dest. Failures are
-// logged, not returned: a proxy can always be regenerated.
-func (e *Env) copyProxies(ctx context.Context, a catalog.Asset, rootOf func(catalog.Location) (string, bool), dest place) int {
-	proxies, err := e.Catalog.Proxies(ctx, a.ID)
-	if err != nil || len(proxies) == 0 {
+// syncCompanions brings the asset's companions to dest and returns how
+// many it wrote. Proxies are copied once and never replaced; sidecars are
+// rewritten whenever the best copy's content differs, because editors
+// change them after import. With sidecarsOnly, proxies are left alone.
+// Failures are logged, not returned: nothing here blocks the original.
+func (e *Env) syncCompanions(ctx context.Context, a catalog.Asset, rootOf func(catalog.Location) (string, bool), dest place, sidecarsOnly bool) int {
+	comps, err := e.Catalog.Companions(ctx, a.ID)
+	if err != nil || len(comps) == 0 {
 		return 0
 	}
 	locs, _ := e.Catalog.AllLocations(ctx)
@@ -291,21 +317,75 @@ func (e *Env) copyProxies(ctx context.Context, a catalog.Asset, rootOf func(cata
 	for _, l := range locs {
 		locByID[l.ID] = l
 	}
+	// Prefer a copy from anywhere but dest itself as the source of truth.
+	srcRoot := func(l catalog.Location) (string, bool) {
+		if l.ID == dest.cat.ID {
+			return "", false
+		}
+		return rootOf(l)
+	}
 	t, _ := e.Config.Tree(a.Kind)
 	n := 0
-	for ext, src := range bestProxies(proxies, locByID, rootOf) {
-		rel := path.Join(t.Subdir, naming.ProxyPath(a.RelPath, ext))
-		if _, err := copyfile.Copy(ctx, src, abs(dest.root, rel), copyfile.Options{}); err != nil {
-			e.logf("warning: proxy %s: %v", src, err)
+	for key, src := range bestCompanions(comps, locByID, srcRoot) {
+		if sidecarsOnly && key.role.Regenerable() {
 			continue
 		}
-		if err := e.Catalog.PutProxy(ctx, catalog.Proxy{AssetID: a.ID, LocationID: dest.cat.ID, RelPath: rel, Ext: ext}); err != nil {
-			e.logf("warning: recording proxy %s: %v", rel, err)
+		rel := path.Join(t.Subdir, companionPath(a.RelPath, key.role, key.ext))
+		dst := abs(dest.root, rel)
+		var sum string
+		if key.role.Regenerable() {
+			if _, err := copyfile.Copy(ctx, src, dst, copyfile.Options{}); err != nil {
+				e.logf("warning: proxy %s: %v", src, err)
+				continue
+			}
+			sum, _ = identity.FullFile(dst)
+		} else {
+			changed, err := replaceIfDifferent(src, dst)
+			if err != nil {
+				e.logf("warning: sidecar %s: %v", src, err)
+				continue
+			}
+			if !changed {
+				continue
+			}
+			sum, _ = identity.FullFile(dst)
+		}
+		if err := e.Catalog.PutCompanion(ctx, catalog.Companion{AssetID: a.ID, LocationID: dest.cat.ID, Role: key.role, Ext: key.ext, RelPath: rel, SHA256: sum}); err != nil {
+			e.logf("warning: recording companion %s: %v", rel, err)
 			continue
 		}
 		n++
 	}
 	return n
+}
+
+// replaceIfDifferent makes dst a copy of src unless it already is one,
+// writing through a temporary name so dst is never half-written. This is
+// the one place the tool overwrites a file on any tier, and it is only ever
+// used for sidecars.
+func replaceIfDifferent(src, dst string) (bool, error) {
+	want, err := identity.FullFile(src)
+	if err != nil {
+		return false, err
+	}
+	if have, err := identity.FullFile(dst); err == nil && have == want {
+		return false, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return false, err
+	}
+	b, err := os.ReadFile(src)
+	if err != nil {
+		return false, err
+	}
+	tmp := dst + copyfile.PartialSuffix
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return false, err
+	}
+	if st, err := os.Stat(src); err == nil {
+		_ = os.Chtimes(tmp, st.ModTime(), st.ModTime())
+	}
+	return true, os.Rename(tmp, dst)
 }
 
 // FlushOptions select what to remove from a spool.
@@ -391,7 +471,7 @@ func (e *Env) Flush(ctx context.Context, ps []place, spoolName string, opts Flus
 		if err := e.Catalog.DeleteCopy(ctx, a.ID, spool.cat.ID); err != nil {
 			return rep, err
 		}
-		e.dropSpoolProxies(ctx, a, *spool)
+		e.dropSpoolCompanions(ctx, a, *spool, rootOf)
 		rep.Flushed = append(rep.Flushed, a.ID)
 		rep.Freed += a.Size
 	}
@@ -458,21 +538,62 @@ func mustRoot(rootOf func(catalog.Location) (string, bool), l catalog.Location) 
 	return r
 }
 
-// dropSpoolProxies removes the asset's proxies from a spool being flushed.
-// Proxies are regenerable, so no NAS copy is required first.
-func (e *Env) dropSpoolProxies(ctx context.Context, a catalog.Asset, spool place) {
-	proxies, err := e.Catalog.Proxies(ctx, a.ID)
+// dropSpoolCompanions removes the asset's companions from a spool being
+// flushed. Proxies just go. A sidecar is first brought up to date on the
+// NAS (it may have been edited since it was archived) and is kept if that
+// fails, so a sidecar is never the last copy that gets deleted.
+func (e *Env) dropSpoolCompanions(ctx context.Context, a catalog.Asset, spool place, rootOf func(catalog.Location) (string, bool)) {
+	comps, err := e.Catalog.Companions(ctx, a.ID)
 	if err != nil {
 		return
 	}
-	for _, p := range proxies {
-		if p.LocationID != spool.cat.ID {
-			continue
-		}
-		if err := os.Remove(abs(spool.root, p.RelPath)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			e.logf("warning: removing proxy %s: %v", p.RelPath, err)
-			continue
-		}
-		_ = e.Catalog.DeleteProxy(ctx, a.ID, spool.cat.ID, p.Ext)
+	locs, _ := e.Catalog.AllLocations(ctx)
+	locByID := map[int64]catalog.Location{}
+	for _, l := range locs {
+		locByID[l.ID] = l
 	}
+	t, _ := e.Config.Tree(a.Kind)
+	for _, c := range comps {
+		if c.LocationID != spool.cat.ID {
+			continue
+		}
+		src := abs(spool.root, c.RelPath)
+		if !c.Role.Regenerable() {
+			if !e.sidecarSafeOnNAS(ctx, a, c, src, t.Subdir, locByID, rootOf) {
+				e.logf("keeping sidecar %s: no verified NAS copy", c.RelPath)
+				continue
+			}
+		}
+		if err := os.Remove(src); err != nil && !errors.Is(err, os.ErrNotExist) {
+			e.logf("warning: removing %s: %v", c.RelPath, err)
+			continue
+		}
+		_ = e.Catalog.DeleteCompanion(ctx, a.ID, spool.cat.ID, c.Role, c.Ext)
+	}
+}
+
+// sidecarSafeOnNAS makes sure some mounted NAS holds a byte-identical copy
+// of the sidecar at src, writing it if needed, and reports success.
+func (e *Env) sidecarSafeOnNAS(ctx context.Context, a catalog.Asset, c catalog.Companion, src, subdir string, locByID map[int64]catalog.Location, rootOf func(catalog.Location) (string, bool)) bool {
+	for _, l := range locByID {
+		if l.Kind != catalog.NAS {
+			continue
+		}
+		root, ok := rootOf(l)
+		if !ok {
+			continue
+		}
+		rel := path.Join(subdir, companionPath(a.RelPath, c.Role, c.Ext))
+		dst := abs(root, rel)
+		if _, err := replaceIfDifferent(src, dst); err != nil {
+			e.logf("warning: syncing sidecar to %s: %v", l.Name, err)
+			continue
+		}
+		sum, _ := identity.FullFile(dst)
+		if err := e.Catalog.PutCompanion(ctx, catalog.Companion{AssetID: a.ID, LocationID: l.ID, Role: c.Role, Ext: c.Ext, RelPath: rel, SHA256: sum}); err != nil {
+			continue
+		}
+		return true
+	}
+	return false
 }

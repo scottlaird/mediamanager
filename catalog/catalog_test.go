@@ -303,23 +303,32 @@ func TestSourceFileCache(t *testing.T) {
 	}
 }
 
-func TestProxiesAndImports(t *testing.T) {
+func TestCompanionsAndImports(t *testing.T) {
 	c := open(t)
 	spool := loc(t, c, Spool, "spool", 0)
 	a := video("3f9a1c2e7b4d5a60", "a.braw", shot)
 	c.PutAsset(ctx, a)
-	if err := c.PutProxy(ctx, Proxy{a.ID, spool.ID, "Proxy/a.mp4", "mp4", "deadbeef"}); err != nil {
+	for _, cp := range []Companion{
+		{a.ID, spool.ID, RoleProxy, "mp4", "Proxy/a.mp4", "deadbeef"},
+		{a.ID, spool.ID, RoleSidecar, "sidecar", "a.sidecar", ""},
+		{a.ID, spool.ID, RoleProxySidecar, "sidecar", "Proxy/a.sidecar", ""},
+	} {
+		if err := c.PutCompanion(ctx, cp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ps, _ := c.Companions(ctx, a.ID)
+	if len(ps) != 3 || ps[0].RelPath != "Proxy/a.mp4" || ps[2].Role != RoleSidecar {
+		t.Errorf("companions = %+v", ps)
+	}
+	if err := c.DeleteCompanion(ctx, a.ID, spool.ID, RoleProxy, "mp4"); err != nil {
 		t.Fatal(err)
 	}
-	ps, _ := c.Proxies(ctx, a.ID)
-	if len(ps) != 1 || ps[0].RelPath != "Proxy/a.mp4" {
-		t.Errorf("proxies = %+v", ps)
+	if ps, _ = c.Companions(ctx, a.ID); len(ps) != 2 {
+		t.Errorf("companions after delete = %+v", ps)
 	}
-	if err := c.DeleteProxy(ctx, a.ID, spool.ID, "mp4"); err != nil {
-		t.Fatal(err)
-	}
-	if ps, _ = c.Proxies(ctx, a.ID); len(ps) != 0 {
-		t.Errorf("proxies after delete = %+v", ps)
+	if RoleProxy.Regenerable() == false || RoleSidecar.Regenerable() {
+		t.Error("Regenerable wrong")
 	}
 
 	id, err := c.BeginImport(ctx, spool.ID)

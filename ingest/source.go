@@ -25,11 +25,11 @@ type Source struct {
 	Assets []string
 	New    []string
 	// Unrecognised are non-junk files with no known extension; Unrouted
-	// are recognised kinds with no tree configured; OrphanProxies are
-	// proxies whose original was not on the source.
-	Unrecognised  []string
-	Unrouted      []string
-	OrphanProxies []string
+	// are recognised kinds with no tree configured; Orphans are proxies
+	// and sidecars whose original was not on the source.
+	Unrecognised []string
+	Unrouted     []string
+	Orphans      []string
 }
 
 // ScanSource registers everything on the source at root: each original
@@ -54,7 +54,7 @@ func (e *Env) ScanSource(ctx context.Context, root string) (*Source, error) {
 	byKey := map[string]catalog.Asset{} // originals by dir/base, for proxy pairing
 
 	for _, f := range res.Files {
-		if f.Proxy {
+		if !f.IsOriginal() {
 			continue
 		}
 		if _, ok := e.Config.Tree(f.Kind); !ok {
@@ -72,15 +72,20 @@ func (e *Env) ScanSource(ctx context.Context, root string) (*Source, error) {
 		byKey[path.Join(f.OriginalDir(), f.Base())] = a
 	}
 	for _, f := range res.Files {
-		if !f.Proxy {
+		if f.IsOriginal() {
 			continue
 		}
 		a, ok := byKey[path.Join(f.OriginalDir(), f.Base())]
 		if !ok || a.Kind != media.Video {
-			src.OrphanProxies = append(src.OrphanProxies, f.Rel)
+			src.Orphans = append(src.Orphans, f.Rel)
 			continue
 		}
-		if err := e.Catalog.PutProxy(ctx, catalog.Proxy{AssetID: a.ID, LocationID: loc.ID, RelPath: f.Rel, Ext: f.Ext}); err != nil {
+		sum, err := identity.FullFile(f.Abs)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", f.Rel, err)
+		}
+		cp := catalog.Companion{AssetID: a.ID, LocationID: loc.ID, Role: catalog.Role(f.Role), Ext: f.Ext, RelPath: f.Rel, SHA256: sum}
+		if err := e.Catalog.PutCompanion(ctx, cp); err != nil {
 			return nil, err
 		}
 	}

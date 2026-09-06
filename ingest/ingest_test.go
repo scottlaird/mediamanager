@@ -483,8 +483,8 @@ func TestUnroutedAndOrphanProxies(t *testing.T) {
 	if !equalStrings(sum.Source.Unrouted, []string{"ZOOM0001.WAV"}) {
 		t.Errorf("unrouted = %v", sum.Source.Unrouted)
 	}
-	if !equalStrings(sum.Source.OrphanProxies, []string{"Proxy/LONELY.mp4"}) {
-		t.Errorf("orphan proxies = %v", sum.Source.OrphanProxies)
+	if !equalStrings(sum.Source.Orphans, []string{"Proxy/LONELY.mp4"}) {
+		t.Errorf("orphans = %v", sum.Source.Orphans)
 	}
 	if len(sum.Source.Assets) != 1 || !sum.SafeToFormat {
 		t.Errorf("summary: %+v", sum)
@@ -572,6 +572,80 @@ func TestAudioOwnTreeStaysSeparate(t *testing.T) {
 	}
 	if !exists(filepath.Join(f.nas, "audio", "2026/09/05")) || !exists(filepath.Join(f.links, "audio", "2026/09/05")) {
 		t.Error("audio not in its own tree")
+	}
+}
+
+func TestSidecarsTravelAndStayCurrent(t *testing.T) {
+	f := newFixture(t, audioNone)
+	card := mkCard(t, f.base, "card", map[string]int{
+		"A005_12062359_C001.braw":          2 * mib,
+		"A005_12062359_C001.sidecar":       900,
+		"Proxy/A005_12062359_C001.mp4":     4096,
+		"Proxy/A005_12062359_C001.sidecar": 800,
+	}, 31)
+	clip := f.relOf(t, filepath.Join(card, "A005_12062359_C001.braw"), media.Video)
+	side := naming.SidecarPath(clip)
+	pside := naming.ProxySidecarPath(clip)
+
+	sum, err := f.env.Import(ctx, card)
+	if err != nil || len(sum.Failures) != 0 || len(sum.Source.Orphans) != 0 {
+		t.Fatalf("import: %+v, %v", sum, err)
+	}
+	for _, rel := range []string{side, pside, naming.ProxyPath(clip, "mp4")} {
+		for _, root := range []string{f.spool, f.nas} {
+			if !exists(filepath.Join(root, "video", rel)) {
+				t.Errorf("%s missing from %s", rel, root)
+			}
+		}
+		if got := readlink(t, filepath.Join(f.links, "video", rel)); got != filepath.Join(f.spool, "video", rel) {
+			t.Errorf("%s -> %s", rel, got)
+		}
+	}
+	if !sameContent(t, filepath.Join(card, "A005_12062359_C001.sidecar"), filepath.Join(f.nas, "video", side)) {
+		t.Error("NAS sidecar differs from card")
+	}
+
+	// The editor writes to the sidecar through the link (i.e. the spool copy).
+	edited := []byte("edited by resolve: new colour science")
+	if err := os.WriteFile(filepath.Join(f.links, "video", side), edited, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if sameContent(t, filepath.Join(f.spool, "video", side), filepath.Join(f.nas, "video", side)) {
+		t.Fatal("edit through the link did not land in the spool")
+	}
+	// A later import of the same card refreshes the NAS sidecar without touching the original.
+	before, _ := os.Stat(filepath.Join(f.nas, "video", clip))
+	if _, err := f.env.Import(ctx, card); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := os.Stat(filepath.Join(f.nas, "video", clip))
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Error("original rewritten while syncing sidecars")
+	}
+	if got, _ := os.ReadFile(filepath.Join(f.nas, "video", side)); string(got) != string(edited) {
+		t.Errorf("NAS sidecar not refreshed: %q", got)
+	}
+
+	// Edit again, then flush: the sidecar is synced before it leaves the spool.
+	edited2 := []byte("edited again just before flush")
+	os.WriteFile(filepath.Join(f.links, "video", side), edited2, 0o644)
+	rep, err := f.env.FlushSpool(ctx, "fast", FlushOptions{})
+	if err != nil || len(rep.Flushed) != 1 {
+		t.Fatalf("flush: %+v, %v", rep, err)
+	}
+	for _, rel := range []string{clip, side, pside, naming.ProxyPath(clip, "mp4")} {
+		if exists(filepath.Join(f.spool, "video", rel)) {
+			t.Errorf("%s still in spool", rel)
+		}
+		if got := readlink(t, filepath.Join(f.links, "video", rel)); got != filepath.Join(f.nas, "video", rel) {
+			t.Errorf("after flush %s -> %s", rel, got)
+		}
+	}
+	if got, _ := os.ReadFile(filepath.Join(f.nas, "video", side)); string(got) != string(edited2) {
+		t.Errorf("NAS sidecar after flush: %q", got)
+	}
+	if bad, err := linktree.Audit(filepath.Join(f.links, "video")); err != nil {
+		t.Errorf("audit: %v %v", bad, err)
 	}
 }
 

@@ -102,6 +102,7 @@ func (e *Env) Import(ctx context.Context, sourceRoot string) (*Summary, error) {
 			continue
 		}
 		if done {
+			archive <- id // no-op for the original; refreshes sidecars on the NAS
 			continue
 		}
 		r, err := e.Spool(ctx, ps, id)
