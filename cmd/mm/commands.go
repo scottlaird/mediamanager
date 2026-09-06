@@ -13,12 +13,14 @@ import (
 
 	"github.com/scottlaird/mediamanager/catalog"
 	"github.com/scottlaird/mediamanager/ingest"
+	mmtemporal "github.com/scottlaird/mediamanager/temporal"
 	"github.com/scottlaird/mediamanager/volume"
 	"github.com/spf13/cobra"
 )
 
 func importCmd() *cobra.Command {
-	return &cobra.Command{
+	var detach bool
+	cmd := &cobra.Command{
 		Use:   "import <source>...",
 		Short: "Register, link, spool and archive everything on one or more sources",
 		Long: `Import scans each source (a mounted card or camera), gives every new file
@@ -32,6 +34,12 @@ at a time per source. Re-running on the same source is safe and cheap.`,
 				return err
 			}
 			defer done()
+			if c, q, ok, err := temporalClient(env); err != nil {
+				return err
+			} else if ok {
+				defer c.Close()
+				return importViaTemporal(cmd.Context(), c, q, args, detach)
+			}
 			var (
 				wg   sync.WaitGroup
 				mu   sync.Mutex
@@ -62,6 +70,9 @@ at a time per source. Re-running on the same source is safe and cheap.`,
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&detach, "detach", false, "with Temporal: start the workflows and return without waiting")
+	cmd.Flags().BoolVar(&local, "local", false, "run in-process even if temporal is configured")
+	return cmd
 }
 
 func printSummary(w io.Writer, src string, s *ingest.Summary) {
@@ -90,7 +101,7 @@ func printSummary(w io.Writer, src string, s *ingest.Summary) {
 }
 
 func archiveCmd() *cobra.Command {
-	var dryRun bool
+	var dryRun, detach bool
 	cmd := &cobra.Command{
 		Use:   "archive",
 		Short: "Copy every asset that is not yet on the NAS, from wherever it is",
@@ -109,6 +120,31 @@ func archiveCmd() *cobra.Command {
 				printArchivePlan(os.Stdout, plan)
 				return nil
 			}
+			if c, q, ok, err := temporalClient(env); err != nil {
+				return err
+			} else if ok {
+				defer c.Close()
+				run, err := mmtemporal.StartArchiveBacklog(cmd.Context(), c, q)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("workflow %s run %s\n", run.GetID(), run.GetRunID())
+				if detach {
+					return nil
+				}
+				var res mmtemporal.BacklogResult
+				if err := run.Get(cmd.Context(), &res); err != nil {
+					return err
+				}
+				fmt.Printf("%d archived of %d\n", res.Archived, res.Assets)
+				for _, f := range res.Failures {
+					fmt.Printf("  FAILED %s\n", f)
+				}
+				if len(res.Failures) > 0 {
+					return errors.New("archive finished with errors")
+				}
+				return nil
+			}
 			sum, err := env.ArchiveAll(cmd.Context())
 			if err != nil {
 				return err
@@ -124,6 +160,8 @@ func archiveCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVarP(&dryRun, "dry-run", "n", false, "show what would be copied, from where, without copying")
+	cmd.Flags().BoolVar(&detach, "detach", false, "with Temporal: start the workflow and return without waiting")
+	cmd.Flags().BoolVar(&local, "local", false, "run in-process even if temporal is configured")
 	return cmd
 }
 
@@ -184,8 +222,19 @@ func flushCmd() *cobra.Command {
 				return err
 			}
 			defer done()
-			rep, err := env.FlushSpool(cmd.Context(), args[0], opts)
-			if err != nil {
+			var rep ingest.FlushReport
+			if c, q, ok, err := temporalClient(env); err != nil {
+				return err
+			} else if ok && !dryRun {
+				defer c.Close()
+				run, err := mmtemporal.StartFlush(cmd.Context(), c, q, args[0], opts)
+				if err != nil {
+					return err
+				}
+				if err := run.Get(cmd.Context(), &rep); err != nil {
+					return err
+				}
+			} else if rep, err = env.FlushSpool(cmd.Context(), args[0], opts); err != nil {
 				return err
 			}
 			verb := "flushed"
@@ -202,6 +251,7 @@ func flushCmd() *cobra.Command {
 	cmd.Flags().StringVar(&free, "free", "", "stop once this much is freed, e.g. 2T or 500G (default: everything eligible)")
 	cmd.Flags().StringVar(&older, "older-than", "", "only assets captured longer ago than this, e.g. 30d or 12h")
 	cmd.Flags().BoolVarP(&dryRun, "dry-run", "n", false, "report without deleting")
+	cmd.Flags().BoolVar(&local, "local", false, "run in-process even if temporal is configured")
 	return cmd
 }
 

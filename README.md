@@ -48,3 +48,23 @@ mounts a second disk with the same name as `/Volumes/Name 1`.
 
 `mm import` prints whether every file on the card has reached the NAS. It
 never erases a card; format it in the camera.
+
+## Temporal (optional)
+
+With a `temporal:` section in the config, `mm import`, `mm archive` and
+`mm flush` run as Temporal workflows instead of in-process, which gives
+them crash recovery, retries with backoff, and a history you can read in
+the Temporal UI. For one machine:
+
+    temporal server start-dev --db-filename ~/.local/share/mediamanager/temporal.db
+    mm worker                                 # in another terminal, keep running
+
+```yaml
+temporal: {}        # defaults: localhost:7233, namespace default, task_queue mediamanager
+```
+
+Then the usual commands start workflows and wait for them; `--detach`
+returns immediately and `--local` runs in-process regardless. Copies to
+the NAS run on their own task queue bounded by `concurrency.nas`. An
+import that is interrupted resumes where it was the next time the worker
+runs; a pulled card never stops a NAS copy already under way.
