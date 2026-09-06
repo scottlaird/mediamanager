@@ -2,7 +2,10 @@ module github.com/scottlaird/mediamanager
 
 go 1.25.0
 
-require modernc.org/sqlite v1.58.0
+require (
+	go.yaml.in/yaml/v4 v4.0.0-rc.6
+	modernc.org/sqlite v1.58.0
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
