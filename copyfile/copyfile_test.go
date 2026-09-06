@@ -166,7 +166,7 @@ func TestCopyResumes(t *testing.T) {
 		dst := filepath.Join(dir, "out.braw")
 		os.WriteFile(dst+PartialSuffix, tt.partial(b), 0o644)
 
-		res, err := Copy(context.Background(), src, dst, Options{})
+		res, err := Copy(context.Background(), src, dst, Options{HashResumedPrefix: true})
 		if err != nil {
 			t.Errorf("%s: %v", tt.name, err)
 			continue
@@ -232,8 +232,22 @@ func TestCopyCancelThenResume(t *testing.T) {
 	if got := mustRead(t, dst); !bytes.Equal(got, b) {
 		t.Error("content differs after resume")
 	}
-	if res.FullSHA256 != sha(b) {
-		t.Errorf("full hash after resume got %s, want %s", res.FullSHA256, sha(b))
+	if res.FullSHA256 != "" {
+		t.Errorf("resumed copy without HashResumedPrefix reported a full hash %s", res.FullSHA256)
+	}
+}
+
+func TestResumeHashesPrefixOnlyWhenAsked(t *testing.T) {
+	dir := t.TempDir()
+	src, b := writeSource(t, dir, "clip.braw", 5*mib)
+	dst := filepath.Join(dir, "out.braw")
+	os.WriteFile(dst+PartialSuffix, b[:3*mib], 0o644)
+	res, err := Copy(context.Background(), src, dst, Options{HashResumedPrefix: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Resumed != 3*mib || res.FullSHA256 != sha(b) {
+		t.Errorf("result %+v", res)
 	}
 }
 
