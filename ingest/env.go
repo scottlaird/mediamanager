@@ -15,6 +15,7 @@ import (
 	"path"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/scottlaird/mediamanager/catalog"
@@ -46,6 +47,7 @@ type Env struct {
 
 	assetMu sync.Mutex
 	assets  map[string]*sync.Mutex
+	copySeq atomic.Int64
 }
 
 // lockAsset serialises tier transitions of one asset, so two concurrent

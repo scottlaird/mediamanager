@@ -48,6 +48,12 @@ type Options struct {
 	ProgressEvery int64
 	// BufferSize defaults to 4 MiB.
 	BufferSize int
+	// HashResumedPrefix re-reads the kept part of a partial so FullSHA256
+	// covers the whole file. Off by default: on a network filesystem that
+	// is a full read of everything already copied before any new byte
+	// moves, and it verifies nothing the tail check did not. Without it a
+	// resumed copy reports an empty FullSHA256.
+	HashResumedPrefix bool
 }
 
 // Result describes a finished Copy.
@@ -55,8 +61,8 @@ type Result struct {
 	Size int64
 	// ID is the sparse identity, verified on the destination.
 	ID identity.ID
-	// FullSHA256 covers every byte of the destination, including any prefix
-	// reused from a partial (that prefix is re-read locally to hash it).
+	// FullSHA256 covers every byte of the destination. It is empty for a
+	// resumed copy unless Options.HashResumedPrefix was set.
 	FullSHA256 string
 	// Resumed is how many bytes were kept from an existing partial.
 	Resumed int64
@@ -109,7 +115,7 @@ func Copy(ctx context.Context, src, dst string, opts Options) (Result, error) {
 	defer out.Close()
 
 	h := identity.NewFullHasher()
-	resumed, err := resumePoint(in, out, size, h)
+	resumed, err := resumePoint(in, out, size, h, opts.HashResumedPrefix)
 	if err != nil {
 		return Result{}, err
 	}
@@ -136,12 +142,11 @@ func Copy(ctx context.Context, src, dst string, opts Options) (Result, error) {
 	}
 	syncDir(filepath.Dir(dst))
 
-	return Result{
-		Size:       size,
-		ID:         srcID,
-		FullSHA256: identity.FormatFull(h),
-		Resumed:    resumed,
-	}, nil
+	res := Result{Size: size, ID: srcID, Resumed: resumed}
+	if resumed == 0 || opts.HashResumedPrefix {
+		res.FullSHA256 = identity.FormatFull(h)
+	}
+	return res, nil
 }
 
 func (o Options) withDefaults() Options {
@@ -192,11 +197,12 @@ func verify(f *os.File, size int64, want identity.ID) (identity.ID, error) {
 	return got, nil
 }
 
-// resumePoint decides how much of an existing partial to keep. The kept
-// prefix is re-read into h so the full hash still covers the whole file.
-// Anything doubtful is thrown away: a partial longer than the source, or one
-// whose final bytes differ from the source at the same offset.
-func resumePoint(in, out *os.File, size int64, h io.Writer) (int64, error) {
+// resumePoint decides how much of an existing partial to keep. With
+// hashPrefix the kept prefix is re-read into h so the full hash still
+// covers the whole file. Anything doubtful is thrown away: a partial longer
+// than the source, or one whose final bytes differ from the source at the
+// same offset.
+func resumePoint(in, out *os.File, size int64, h io.Writer, hashPrefix bool) (int64, error) {
 	st, err := out.Stat()
 	if err != nil {
 		return 0, err
@@ -208,8 +214,10 @@ func resumePoint(in, out *os.File, size int64, h io.Writer) (int64, error) {
 		}
 		return 0, nil
 	}
-	if _, err := io.Copy(h, io.NewSectionReader(out, 0, n)); err != nil {
-		return 0, err
+	if hashPrefix {
+		if _, err := io.Copy(h, io.NewSectionReader(out, 0, n)); err != nil {
+			return 0, err
+		}
 	}
 	return n, nil
 }
