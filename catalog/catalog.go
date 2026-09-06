@@ -26,7 +26,7 @@ import (
 var schema string
 
 // schemaVersion is stored in PRAGMA user_version. Bump it with any migration.
-const schemaVersion = 1
+const schemaVersion = 2
 
 var (
 	ErrNotFound = errors.New("catalog: not found")
@@ -74,6 +74,13 @@ func (c *DB) migrate(ctx context.Context) error {
 	}
 	if v > schemaVersion {
 		return fmt.Errorf("catalog: schema version %d is newer than this build (%d)", v, schemaVersion)
+	}
+	if v == 1 {
+		// v1 had a proxies table; companions generalise it. Nothing but
+		// test catalogs ever ran v1, so the old rows are not carried over.
+		if _, err := c.db.ExecContext(ctx, `DROP TABLE IF EXISTS proxies`); err != nil {
+			return err
+		}
 	}
 	if _, err := c.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("catalog: creating schema: %w", err)
@@ -375,43 +382,64 @@ func (c *DB) assets(ctx context.Context, q string, args ...any) ([]Asset, error)
 	return out, rows.Err()
 }
 
-// Proxy is a regenerable derivative of an asset on one location. Proxies are
+// Role says what a companion is to its asset.
+type Role string
+
+const (
+	// RoleProxy is a lower-resolution copy for editing, regenerable, in a
+	// Proxy directory beside the original.
+	RoleProxy Role = "proxy"
+	// RoleSidecar is a metadata file beside the original (Blackmagic's
+	// .sidecar). Editors write to it, so it is the one thing in the system
+	// that changes after import; it is never regenerable.
+	RoleSidecar Role = "sidecar"
+	// RoleProxySidecar is a sidecar that lives beside the proxy.
+	RoleProxySidecar Role = "proxy-sidecar"
+)
+
+// Regenerable reports whether losing the companion loses nothing.
+func (r Role) Regenerable() bool { return r == RoleProxy }
+
+// Companion is a file that belongs with an asset on one location. They are
 // tracked apart from copies so nothing ever counts one as a copy of the
-// original.
-type Proxy struct {
+// original (rule R1).
+type Companion struct {
 	AssetID    string
 	LocationID int64
-	RelPath    string
+	Role       Role
 	Ext        string
+	RelPath    string
 	SHA256     string
 }
 
-func (c *DB) PutProxy(ctx context.Context, p Proxy) error {
+func (c *DB) PutCompanion(ctx context.Context, cp Companion) error {
 	_, err := c.db.ExecContext(ctx, `
-		INSERT INTO proxies (asset_id, location_id, relpath, ext, sha256) VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(asset_id, location_id, ext) DO UPDATE SET relpath = excluded.relpath, sha256 = excluded.sha256`,
-		p.AssetID, p.LocationID, p.RelPath, p.Ext, p.SHA256)
+		INSERT INTO companions (asset_id, location_id, role, ext, relpath, sha256) VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(asset_id, location_id, role, ext) DO UPDATE SET relpath = excluded.relpath, sha256 = excluded.sha256`,
+		cp.AssetID, cp.LocationID, cp.Role, cp.Ext, cp.RelPath, cp.SHA256)
 	return err
 }
 
-func (c *DB) DeleteProxy(ctx context.Context, assetID string, locationID int64, ext string) error {
-	return c.update(ctx, `DELETE FROM proxies WHERE asset_id = ? AND location_id = ? AND ext = ?`, assetID, locationID, ext)
+func (c *DB) DeleteCompanion(ctx context.Context, assetID string, locationID int64, role Role, ext string) error {
+	return c.update(ctx, `DELETE FROM companions WHERE asset_id = ? AND location_id = ? AND role = ? AND ext = ?`,
+		assetID, locationID, role, ext)
 }
 
-func (c *DB) Proxies(ctx context.Context, assetID string) ([]Proxy, error) {
+// Companions lists every companion of an asset on every location.
+func (c *DB) Companions(ctx context.Context, assetID string) ([]Companion, error) {
 	rows, err := c.db.QueryContext(ctx,
-		`SELECT asset_id, location_id, relpath, ext, sha256 FROM proxies WHERE asset_id = ? ORDER BY location_id, ext`, assetID)
+		`SELECT asset_id, location_id, role, ext, relpath, sha256 FROM companions WHERE asset_id = ? ORDER BY location_id, role, ext`, assetID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Proxy
+	var out []Companion
 	for rows.Next() {
-		var p Proxy
-		if err := rows.Scan(&p.AssetID, &p.LocationID, &p.RelPath, &p.Ext, &p.SHA256); err != nil {
+		var cp Companion
+		if err := rows.Scan(&cp.AssetID, &cp.LocationID, &cp.Role, &cp.Ext, &cp.RelPath, &cp.SHA256); err != nil {
 			return nil, err
 		}
-		out = append(out, p)
+		out = append(out, cp)
 	}
 	return out, rows.Err()
 }

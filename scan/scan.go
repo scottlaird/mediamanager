@@ -37,6 +37,21 @@ func (s Shape) String() string {
 	return "flat"
 }
 
+// Role says what a file is to its original. Values match catalog.Role.
+type Role string
+
+const (
+	// Original is a video, audio or still file in its own right.
+	Original Role = ""
+	// Proxy files live under a Proxy directory and share their original's
+	// base name.
+	Proxy Role = "proxy"
+	// Sidecar files (.sidecar) sit beside the original with the same base.
+	Sidecar Role = "sidecar"
+	// ProxySidecar files sit beside the proxy.
+	ProxySidecar Role = "proxy-sidecar"
+)
+
 // File is one media file found on a source.
 type File struct {
 	// Rel is the slash-separated path relative to the source root.
@@ -47,10 +62,13 @@ type File struct {
 	Ext     string
 	Size    int64
 	ModTime time.Time
-	// Proxy is set when the file lives under a Proxy directory. Its
-	// original is the file in the parent directory with the same Base.
-	Proxy bool
+	// Role is Original for media in its own right; companions carry the
+	// role that says how they attach to the original with the same Base.
+	Role Role
 }
+
+// IsOriginal reports whether f is media rather than a companion.
+func (f File) IsOriginal() bool { return f.Role == Original }
 
 // Base is the filename without directory or extension, which is what
 // pairs a proxy with its original.
@@ -127,7 +145,8 @@ func Scan(root string, c *Classifier) (Result, error) {
 		}
 		rel = filepath.ToSlash(rel)
 		kind, ext := c.Classify(name)
-		if kind == media.Unknown {
+		role := roleOf(rel, kind, ext)
+		if kind == media.Unknown && role == Original {
 			res.Unrecognised = append(res.Unrecognised, rel)
 			return nil
 		}
@@ -142,7 +161,7 @@ func Scan(root string, c *Classifier) (Result, error) {
 			Ext:     ext,
 			Size:    info.Size(),
 			ModTime: info.ModTime(),
-			Proxy:   inProxyDir(rel),
+			Role:    role,
 		})
 		return nil
 	})
@@ -154,16 +173,30 @@ func Scan(root string, c *Classifier) (Result, error) {
 	return res, nil
 }
 
-// inProxyDir reports whether the file's immediate directory is a proxy
-// directory, in any case.
-func inProxyDir(rel string) bool {
-	return strings.EqualFold(path.Base(path.Dir(rel)), "proxy")
+// SidecarExt is Blackmagic's per-clip metadata file extension.
+const SidecarExt = "sidecar"
+
+// roleOf classifies a file by where it sits and what it is: anything in a
+// Proxy directory is a proxy (or a proxy's sidecar), a .sidecar elsewhere
+// is the original's sidecar, and everything else is an original.
+func roleOf(rel string, kind media.Kind, ext string) Role {
+	inProxy := strings.EqualFold(path.Base(path.Dir(rel)), "proxy")
+	switch {
+	case ext == SidecarExt && inProxy:
+		return ProxySidecar
+	case ext == SidecarExt:
+		return Sidecar
+	case inProxy && kind == media.Video:
+		return Proxy
+	}
+	return Original
 }
 
-// OriginalDir returns the directory a proxy's original lives in.
+// OriginalDir returns the directory the file's original lives in: the
+// file's own directory, or its parent for anything under Proxy/.
 func (f File) OriginalDir() string {
-	if !f.Proxy {
-		return path.Dir(f.Rel)
+	if f.Role == Proxy || f.Role == ProxySidecar {
+		return path.Dir(path.Dir(f.Rel))
 	}
-	return path.Dir(path.Dir(f.Rel))
+	return path.Dir(f.Rel)
 }

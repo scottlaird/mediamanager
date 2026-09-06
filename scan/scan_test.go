@@ -67,7 +67,7 @@ func TestScanDCIM(t *testing.T) {
 		t.Errorf("unrecognised = %v, want %v", res.Unrecognised, want)
 	}
 	f := res.Files[0]
-	if f.Kind != media.Video || f.Ext != "mp4" || f.Size != int64(len(f.Rel)) || f.Proxy || f.Base() != "P1000123" {
+	if f.Kind != media.Video || f.Ext != "mp4" || f.Size != int64(len(f.Rel)) || !f.IsOriginal() || f.Base() != "P1000123" {
 		t.Errorf("file = %+v", f)
 	}
 	if res.Files[1].Kind != media.Still {
@@ -79,8 +79,10 @@ func TestScanFlat(t *testing.T) {
 	root := t.TempDir()
 	mkTree(t, root,
 		"A001_09051412_C001.braw",
+		"A001_09051412_C001.sidecar",
 		"A001_09051412_C002.braw",
 		"Proxy/A001_09051412_C001.mp4",
+		"Proxy/A001_09051412_C001.sidecar",
 		"Proxy/A001_09051412_C002.mp4",
 		"Proxy/.DS_Store",
 		"sub/reel2.MOV",
@@ -99,8 +101,10 @@ func TestScanFlat(t *testing.T) {
 	}
 	want := []string{
 		"A001_09051412_C001.braw",
+		"A001_09051412_C001.sidecar",
 		"A001_09051412_C002.braw",
 		"Proxy/A001_09051412_C001.mp4",
+		"Proxy/A001_09051412_C001.sidecar",
 		"Proxy/A001_09051412_C002.mp4",
 		"sub/proxy/reel2.mp4",
 		"sub/reel2.MOV",
@@ -115,15 +119,28 @@ func TestScanFlat(t *testing.T) {
 	for _, f := range res.Files {
 		byRel[f.Rel] = f
 	}
-	for rel, wantProxy := range map[string]bool{
-		"A001_09051412_C001.braw":      false,
-		"Proxy/A001_09051412_C001.mp4": true,
-		"sub/proxy/reel2.mp4":          true,
-		"sub/reel2.MOV":                false,
+	for rel, wantRole := range map[string]Role{
+		"A001_09051412_C001.braw":          Original,
+		"A001_09051412_C001.sidecar":       Sidecar,
+		"Proxy/A001_09051412_C001.mp4":     Proxy,
+		"Proxy/A001_09051412_C001.sidecar": ProxySidecar,
+		"sub/proxy/reel2.mp4":              Proxy,
+		"sub/reel2.MOV":                    Original,
 	} {
-		if byRel[rel].Proxy != wantProxy {
-			t.Errorf("%s: proxy = %v, want %v", rel, byRel[rel].Proxy, wantProxy)
+		if byRel[rel].Role != wantRole {
+			t.Errorf("%s: role = %q, want %q", rel, byRel[rel].Role, wantRole)
 		}
+	}
+	if byRel["A001_09051412_C001.sidecar"].Kind != media.Unknown || byRel["A001_09051412_C001.sidecar"].Ext != "sidecar" {
+		t.Errorf("sidecar file = %+v", byRel["A001_09051412_C001.sidecar"])
+	}
+	for _, rel := range []string{"Proxy/A001_09051412_C001.sidecar", "A001_09051412_C001.sidecar", "Proxy/A001_09051412_C001.mp4"} {
+		if b := byRel[rel].Base(); b != "A001_09051412_C001" {
+			t.Errorf("%s: base %q", rel, b)
+		}
+	}
+	if d := byRel["Proxy/A001_09051412_C001.sidecar"].OriginalDir(); d != "." {
+		t.Errorf("proxy sidecar OriginalDir = %q", d)
 	}
 	if d := byRel["sub/proxy/reel2.mp4"].OriginalDir(); d != "sub" {
 		t.Errorf("OriginalDir = %q, want sub", d)
