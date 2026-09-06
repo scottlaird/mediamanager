@@ -195,7 +195,7 @@ func TestClassify(t *testing.T) {
 func TestIsJunk(t *testing.T) {
 	for name, want := range map[string]bool{
 		".DS_Store": true, "._clip.braw": true, ".Spotlight-V100": true, ".Trashes": true,
-		"Thumbs.db": true, "clip.braw.partial": true,
+		"Thumbs.db": true, "clip.braw.partial": true, ".blackmagicsync-v2": true,
 		"clip.braw": false, ".hidden.mov": false, "_underscore.mp4": false, "Proxy": false,
 	} {
 		if got := IsJunk(name); got != want {

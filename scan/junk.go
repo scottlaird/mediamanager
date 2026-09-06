@@ -18,13 +18,14 @@ var junkNames = map[string]bool{
 }
 
 // IsJunk reports whether a file or directory basename is a platform
-// artefact to ignore. AppleDouble files (._name) and mediamanager's own
-// .partial files count as junk too.
+// artefact to ignore. AppleDouble files (._name), Blackmagic Cloud sync
+// state (.blackmagicsync-*) and mediamanager's own .partial files count
+// as junk too.
 func IsJunk(name string) bool {
 	if junkNames[name] {
 		return true
 	}
-	if strings.HasPrefix(name, "._") {
+	if strings.HasPrefix(name, "._") || strings.HasPrefix(name, ".blackmagicsync") {
 		return true
 	}
 	return strings.HasSuffix(name, ".partial")
