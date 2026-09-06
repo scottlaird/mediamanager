@@ -298,6 +298,19 @@ func (e *Env) IsArchived(ctx context.Context, id string) (bool, error) {
 	return e.archived(ctx, ps, id)
 }
 
+// NeedsArchiveRefs lists assets lacking a NAS copy, oldest capture first.
+func (e *Env) NeedsArchiveRefs(ctx context.Context) ([]AssetRef, error) {
+	assets, err := e.Catalog.NeedsArchive(ctx)
+	if err != nil {
+		return nil, err
+	}
+	refs := make([]AssetRef, 0, len(assets))
+	for _, a := range assets {
+		refs = append(refs, RefOf(a))
+	}
+	return refs, nil
+}
+
 // NeedsArchiveIDs lists assets lacking a NAS copy, oldest capture first.
 func (e *Env) NeedsArchiveIDs(ctx context.Context) ([]string, error) {
 	assets, err := e.Catalog.NeedsArchive(ctx)
