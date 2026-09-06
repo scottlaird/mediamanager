@@ -34,6 +34,20 @@ type Config struct {
 	Locations   []Location      `yaml:"locations"`
 	Extensions  Extensions      `yaml:"extensions"`
 	Concurrency Concurrency     `yaml:"concurrency"`
+	// Temporal, when present, makes the CLI run imports, archives and
+	// flushes as Temporal workflows served by `mm worker`. Absent, the
+	// in-process driver is used.
+	Temporal *Temporal `yaml:"temporal"`
+}
+
+// Temporal is how to reach the Temporal service.
+type Temporal struct {
+	// Address defaults to localhost:7233, the dev server.
+	Address string `yaml:"address"`
+	// Namespace defaults to "default".
+	Namespace string `yaml:"namespace"`
+	// TaskQueue defaults to "mediamanager"; NAS copies use TaskQueue+"-nas".
+	TaskQueue string `yaml:"task_queue"`
 }
 
 // Tree is where one kind's files live inside every location, and where
@@ -117,6 +131,17 @@ func (c *Config) finish() error {
 	}
 	if _, err := c.Location(); err != nil {
 		return err
+	}
+	if t := c.Temporal; t != nil {
+		if t.Address == "" {
+			t.Address = "localhost:7233"
+		}
+		if t.Namespace == "" {
+			t.Namespace = "default"
+		}
+		if t.TaskQueue == "" {
+			t.TaskQueue = "mediamanager"
+		}
 	}
 	if c.Concurrency.PerSource <= 0 {
 		c.Concurrency.PerSource = 1

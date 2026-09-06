@@ -123,6 +123,25 @@ func TestRootSubdir(t *testing.T) {
 	}
 }
 
+func TestTemporalDefaults(t *testing.T) {
+	base := "trees: {video: {link: /v}}\nlocations: [{name: n, kind: nas, path: /n}]\n"
+	c, _ := Parse([]byte(base))
+	if c.Temporal != nil {
+		t.Error("temporal configured by default")
+	}
+	c, err := Parse([]byte(base + "temporal: {}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Temporal == nil || c.Temporal.Address != "localhost:7233" || c.Temporal.Namespace != "default" || c.Temporal.TaskQueue != "mediamanager" {
+		t.Errorf("temporal = %+v", c.Temporal)
+	}
+	c, _ = Parse([]byte(base + "temporal: {address: temporal.lan:7233, task_queue: mm}"))
+	if c.Temporal.Address != "temporal.lan:7233" || c.Temporal.TaskQueue != "mm" || c.Temporal.Namespace != "default" {
+		t.Errorf("temporal = %+v", c.Temporal)
+	}
+}
+
 func TestDefaults(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", "/data")
 	t.Setenv("XDG_CONFIG_HOME", "/conf")

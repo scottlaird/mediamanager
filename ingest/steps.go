@@ -289,9 +289,13 @@ func (e *Env) copyTo(ctx context.Context, ps []place, a catalog.Asset, copies []
 	label := fmt.Sprintf("#%d %s", e.copySeq.Add(1), path.Base(a.RelPath))
 	e.logf("%s: copy %s -> %s (%s)", label, src, dst, fmtBytes(a.Size))
 	var prog *progress
+	external := progressFrom(ctx)
 	res, err := copyfile.Copy(ctx, src, dst, copyfile.Options{
 		ExpectID: expect,
 		Progress: func(done, total int64) {
+			if external != nil {
+				external(done, total)
+			}
 			if prog == nil {
 				// The first report arrives after one buffer past any resumed
 				// prefix; rates are measured from there.
