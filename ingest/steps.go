@@ -284,7 +284,10 @@ func (e *Env) copyTo(ctx context.Context, ps []place, a catalog.Asset, copies []
 	if a.Kind.UsesSparseID() {
 		expect = identity.ID(a.ID)
 	}
-	e.logf("copy %s -> %s (%s)", src, dst, fmtBytes(a.Size))
+	// Copies are numbered so interleaved progress from concurrent copies
+	// reads as separate streams.
+	label := fmt.Sprintf("#%d %s", e.copySeq.Add(1), path.Base(a.RelPath))
+	e.logf("%s: copy %s -> %s (%s)", label, src, dst, fmtBytes(a.Size))
 	var prog *progress
 	res, err := copyfile.Copy(ctx, src, dst, copyfile.Options{
 		ExpectID: expect,
@@ -292,7 +295,7 @@ func (e *Env) copyTo(ctx context.Context, ps []place, a catalog.Asset, copies []
 			if prog == nil {
 				// The first report arrives after one buffer past any resumed
 				// prefix; rates are measured from there.
-				prog = newProgress(e.Logf, a.RelPath, done)
+				prog = newProgress(e.Logf, label, done)
 				return
 			}
 			prog.report(done, total)
@@ -302,9 +305,9 @@ func (e *Env) copyTo(ctx context.Context, ps []place, a catalog.Asset, copies []
 		return CopyResult{}, fmt.Errorf("%s -> %s: %w", a.RelPath, dest.cat.Name, err)
 	}
 	if res.Resumed > 0 {
-		e.logf("  %s: resumed %s already at %s", a.RelPath, fmtBytes(res.Resumed), dest.cat.Name)
+		e.logf("%s: resumed, %s was already at %s", label, fmtBytes(res.Resumed), dest.cat.Name)
 	}
-	e.logf("done %s -> %s", a.RelPath, dest.cat.Name)
+	e.logf("%s: done -> %s", label, dest.cat.Name)
 	full := res.FullSHA256
 	if full == "" {
 		full = a.FullSHA256
