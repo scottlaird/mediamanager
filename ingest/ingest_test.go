@@ -774,6 +774,80 @@ func TestTreeAtLocationRoot(t *testing.T) {
 	}
 }
 
+func TestList(t *testing.T) {
+	f := newFixture(t, audioNone)
+	card := mkCard(t, f.base, "card", map[string]int{
+		"A001_C001.braw":    2 * mib,
+		"A001_C001.sidecar": 300,
+		"B002_C001.braw":    mib,
+		"L1004821.DNG":      50 * 1024,
+	}, 51)
+	if _, err := f.env.Import(ctx, card); err != nil {
+		t.Fatal(err)
+	}
+	paths := func(as []AssetStatus) []string {
+		var out []string
+		for _, a := range as {
+			out = append(out, a.Asset.Kind.String()+"/"+a.Asset.RelPath)
+		}
+		return out
+	}
+	all, err := f.env.List(ctx, ListOptions{Companions: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 3 || all[0].Asset.RelPath > all[1].Asset.RelPath {
+		t.Fatalf("all = %v", paths(all))
+	}
+	var withSidecar int
+	for _, a := range all {
+		if len(a.Companions) > 0 && a.Companions[0].Role == catalog.RoleSidecar {
+			withSidecar++ // one per location the sidecar reached: source, spool, NAS
+			if len(a.Companions) != 3 {
+				t.Errorf("%s: %d companion rows, want 3", a.Asset.RelPath, len(a.Companions))
+			}
+		}
+		if len(a.CopyRows) < 3 { // source, spool, nas
+			t.Errorf("%s: copy rows %d", a.Asset.RelPath, len(a.CopyRows))
+		}
+	}
+	if withSidecar != 1 {
+		t.Errorf("assets with a sidecar = %d", withSidecar)
+	}
+	tests := []struct {
+		name string
+		opts ListOptions
+		want int
+	}{
+		{"kind still", ListOptions{Kind: media.Still}, 1},
+		{"prefix relpath", ListOptions{Prefixes: []string{"2026/09/05/a001"}}, 1},
+		{"prefix kind/relpath", ListOptions{Prefixes: []string{"video/2026"}}, 2},
+		{"prefix day dir with slash", ListOptions{Prefixes: []string{"2026/09/05/"}}, 3},
+		{"prefix miss", ListOptions{Prefixes: []string{"2025"}}, 0},
+		{"two prefixes", ListOptions{Prefixes: []string{"still/", "2026/09/05/b002"}}, 2},
+		{"state archived", ListOptions{States: []string{"archived"}}, 3},
+		{"state flushed", ListOptions{States: []string{"flushed"}}, 0},
+		{"location nas", ListOptions{Location: "nas"}, 3},
+		{"location slow", ListOptions{Location: "slow"}, 0},
+		{"combined", ListOptions{Kind: media.Video, Location: "fast", States: []string{"archived", "spooled"}}, 2},
+	}
+	for _, tt := range tests {
+		got, err := f.env.List(ctx, tt.opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != tt.want {
+			t.Errorf("%s: got %v, want %d", tt.name, paths(got), tt.want)
+		}
+	}
+	if _, err := f.env.FlushSpool(ctx, "fast", FlushOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := f.env.List(ctx, ListOptions{States: []string{"flushed"}}); len(got) != 3 {
+		t.Errorf("after flush: %v", paths(got))
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

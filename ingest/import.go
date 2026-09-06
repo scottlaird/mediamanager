@@ -3,9 +3,13 @@ package ingest
 import (
 	"context"
 	"errors"
+	"slices"
+	"sort"
+	"strings"
 	"sync"
 
 	"github.com/scottlaird/mediamanager/catalog"
+	"github.com/scottlaird/mediamanager/media"
 )
 
 // Failure is one asset that did not finish a step.
@@ -235,7 +239,10 @@ type LocationStatus struct {
 type AssetStatus struct {
 	Asset  catalog.Asset
 	Copies []string // location names holding a complete copy
-	State  string   // discovered, spooled, archived, flushed, partial
+	State  string   // discovered, spooled, archived, flushed, unavailable, with +partial when a copy is in flight
+	// Detail is filled in by List: every copy row and companion.
+	CopyRows   []catalog.Copy
+	Companions []catalog.Companion
 }
 
 // Status reports every location and asset.
@@ -253,6 +260,74 @@ func (e *Env) Status(ctx context.Context) (*Status, error) {
 		}
 		st.Locations = append(st.Locations, ls)
 	}
+	st.Assets, err = e.assetStatuses(ctx, false)
+	return st, err
+}
+
+// ListOptions filter List. Empty fields match everything.
+type ListOptions struct {
+	// Prefixes match the start of "kind/relpath" or of relpath alone.
+	Prefixes []string
+	States   []string
+	// Location keeps assets with a complete copy on that location.
+	Location string
+	Kind     media.Kind
+	// Companions loads companion rows for each asset.
+	Companions bool
+}
+
+// List returns assets matching opts, ordered by relpath then kind, so a
+// shared tree reads in directory order.
+func (e *Env) List(ctx context.Context, opts ListOptions) ([]AssetStatus, error) {
+	e.init()
+	all, err := e.assetStatuses(ctx, opts.Companions)
+	if err != nil {
+		return nil, err
+	}
+	var out []AssetStatus
+	for _, as := range all {
+		if opts.matches(as) {
+			out = append(out, as)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Asset.RelPath != out[j].Asset.RelPath {
+			return out[i].Asset.RelPath < out[j].Asset.RelPath
+		}
+		return out[i].Asset.Kind < out[j].Asset.Kind
+	})
+	return out, nil
+}
+
+func (o ListOptions) matches(as AssetStatus) bool {
+	if o.Kind != media.Unknown && as.Asset.Kind != o.Kind {
+		return false
+	}
+	if len(o.States) > 0 && !slices.Contains(o.States, strings.TrimSuffix(as.State, "+partial")) && !slices.Contains(o.States, as.State) {
+		return false
+	}
+	if o.Location != "" && !slices.Contains(as.Copies, o.Location) {
+		return false
+	}
+	if len(o.Prefixes) > 0 {
+		full := as.Asset.Kind.String() + "/" + as.Asset.RelPath
+		ok := false
+		for _, p := range o.Prefixes {
+			p = strings.TrimPrefix(strings.TrimSuffix(p, "/"), "./")
+			if p == "" || strings.HasPrefix(as.Asset.RelPath, p) || strings.HasPrefix(full, p) {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *Env) assetStatuses(ctx context.Context, withCompanions bool) ([]AssetStatus, error) {
+	var out []AssetStatus
 	for _, kind := range allKinds {
 		assets, err := e.Catalog.AssetsByKind(ctx, kind)
 		if err != nil {
@@ -263,14 +338,20 @@ func (e *Env) Status(ctx context.Context) (*Status, error) {
 			if err != nil {
 				return nil, err
 			}
-			st.Assets = append(st.Assets, assetStatus(a, copies))
+			as := assetStatus(a, copies)
+			if withCompanions {
+				if as.Companions, err = e.Catalog.Companions(ctx, a.ID); err != nil {
+					return nil, err
+				}
+			}
+			out = append(out, as)
 		}
 	}
-	return st, nil
+	return out, nil
 }
 
 func assetStatus(a catalog.Asset, copies []catalog.Copy) AssetStatus {
-	as := AssetStatus{Asset: a}
+	as := AssetStatus{Asset: a, CopyRows: copies}
 	var spool, nas, source, partial bool
 	for _, cp := range copies {
 		if cp.State != catalog.Complete {
