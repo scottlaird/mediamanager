@@ -90,7 +90,8 @@ func printSummary(w io.Writer, src string, s *ingest.Summary) {
 }
 
 func archiveCmd() *cobra.Command {
-	return &cobra.Command{
+	var dryRun bool
+	cmd := &cobra.Command{
 		Use:   "archive",
 		Short: "Copy every asset that is not yet on the NAS, from wherever it is",
 		Args:  cobra.NoArgs,
@@ -100,6 +101,14 @@ func archiveCmd() *cobra.Command {
 				return err
 			}
 			defer done()
+			if dryRun {
+				plan, err := env.ArchivePlan(cmd.Context())
+				if err != nil {
+					return err
+				}
+				printArchivePlan(os.Stdout, plan)
+				return nil
+			}
 			sum, err := env.ArchiveAll(cmd.Context())
 			if err != nil {
 				return err
@@ -114,6 +123,34 @@ func archiveCmd() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().BoolVarP(&dryRun, "dry-run", "n", false, "show what would be copied, from where, without copying")
+	return cmd
+}
+
+func printArchivePlan(w io.Writer, plan []ingest.ArchiveItem) {
+	tw := tabwriter.NewWriter(w, 2, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "SIZE\tPATH\tFROM\tTO\tNOTE")
+	var total, todo int64
+	var blocked int
+	for _, it := range plan {
+		note := it.Reason
+		if it.Resume > 0 {
+			note = fmt.Sprintf("resume %s already on NAS", humanSize(it.Resume))
+		}
+		fmt.Fprintf(tw, "%s\t%s/%s\t%s\t%s\t%s\n", humanSize(it.Asset.Size), it.Asset.Kind, it.Asset.RelPath, it.From, strings.Join(it.To, ","), note)
+		total += it.Asset.Size
+		if it.Reason == "" {
+			todo += it.Asset.Size - it.Resume
+		} else {
+			blocked++
+		}
+	}
+	tw.Flush()
+	fmt.Fprintf(w, "\n%d assets not on the NAS, %s; would copy %s now", len(plan), humanSize(total), humanSize(todo))
+	if blocked > 0 {
+		fmt.Fprintf(w, ", %d cannot be copied yet", blocked)
+	}
+	fmt.Fprintln(w)
 }
 
 func flushCmd() *cobra.Command {
