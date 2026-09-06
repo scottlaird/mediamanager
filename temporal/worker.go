@@ -68,6 +68,7 @@ func StartImport(ctx context.Context, c client.Client, q Queues, root string) (c
 		ID:                       ImportWorkflowID(idSafe(root)),
 		TaskQueue:                q.Main,
 		WorkflowIDConflictPolicy: enums.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+		StaticSummary:            "import " + root,
 	}, ImportSource, root, q)
 }
 
@@ -77,6 +78,7 @@ func StartArchiveBacklog(ctx context.Context, c client.Client, q Queues) (client
 		ID:                       BacklogWorkflowID(),
 		TaskQueue:                q.Main,
 		WorkflowIDConflictPolicy: enums.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+		StaticSummary:            "archive everything not yet on the NAS",
 	}, ArchiveBacklog, q)
 }
 
@@ -86,6 +88,7 @@ func StartFlush(ctx context.Context, c client.Client, q Queues, spool string, op
 		ID:                       FlushWorkflowID(spool),
 		TaskQueue:                q.Main,
 		WorkflowIDConflictPolicy: enums.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+		StaticSummary:            "flush " + spool,
 	}, FlushSpool, spool, opts)
 }
 

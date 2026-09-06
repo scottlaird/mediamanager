@@ -15,15 +15,30 @@ import (
 	"github.com/scottlaird/mediamanager/scan"
 )
 
+// AssetRef names an asset for humans as well as machines: what a workflow
+// or activity input should carry so it can be told apart in a UI.
+type AssetRef struct {
+	ID   string
+	Path string // kind/relpath
+	Size int64
+}
+
+// RefOf builds the AssetRef for an asset.
+func RefOf(a catalog.Asset) AssetRef {
+	return AssetRef{ID: a.ID, Path: a.Kind.String() + "/" + a.RelPath, Size: a.Size}
+}
+
 // Source is the outcome of scanning one mounted source.
 type Source struct {
 	Loc   catalog.Location
 	Root  string
 	Shape scan.Shape
 	// Assets is every asset on the source, new or already known, in scan
-	// order. New is the subset first seen this run.
+	// order. New is the subset first seen this run. Refs describes each
+	// entry of Assets.
 	Assets []string
 	New    []string
+	Refs   []AssetRef
 	// Unrecognised are non-junk files with no known extension; Unrouted
 	// are recognised kinds with no tree configured; Orphans are proxies
 	// and sidecars whose original was not on the source.
@@ -66,6 +81,7 @@ func (e *Env) ScanSource(ctx context.Context, root string) (*Source, error) {
 			return nil, fmt.Errorf("%s: %w", f.Rel, err)
 		}
 		src.Assets = append(src.Assets, a.ID)
+		src.Refs = append(src.Refs, RefOf(a))
 		if isNew {
 			src.New = append(src.New, a.ID)
 		}

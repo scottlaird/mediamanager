@@ -2,6 +2,8 @@ package temporal
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/scottlaird/mediamanager/ingest"
@@ -89,42 +91,45 @@ func ImportSource(ctx workflow.Context, root string, q Queues) (*ImportResult, e
 	}
 
 	children := map[string]workflow.ChildWorkflowFuture{}
-	handoff := func(id string) {
-		if _, done := children[id]; done {
+	handoff := func(ref ingest.AssetRef) {
+		if _, done := children[ref.ID]; done {
 			return
 		}
-		children[id] = startArchive(ctx, id, q)
+		children[ref.ID] = startArchive(ctx, ref, q)
 	}
-	for _, id := range src.Assets {
-		if _, seen := children[id]; seen {
+	refs := src.Refs
+	for i, ref := range refs {
+		if _, seen := children[ref.ID]; seen {
 			continue // same content under two names on one card
 		}
+		workflow.SetCurrentDetails(ctx, fmt.Sprintf("spooling %d/%d: %s (%s)", i+1, len(refs), ref.Path, fmtBytes(ref.Size)))
 		var archived bool
-		if err := workflow.ExecuteActivity(quick, acts.IsArchived, id).Get(ctx, &archived); err != nil {
-			res.Failures = append(res.Failures, id+": "+err.Error())
+		if err := workflow.ExecuteActivity(quick, acts.IsArchived, ref.ID).Get(ctx, &archived); err != nil {
+			res.Failures = append(res.Failures, ref.Path+": "+err.Error())
 			continue
 		}
 		if !archived {
 			var r ingest.CopyResult
-			err := workflow.ExecuteActivity(spool, acts.Spool, id).Get(ctx, &r)
+			err := workflow.ExecuteActivity(withSummary(spool, ref.Path), acts.Spool, ref).Get(ctx, &r)
 			switch {
 			case isType(err, ErrTypeSpoolFull):
-				res.SpoolFull = append(res.SpoolFull, id)
+				res.SpoolFull = append(res.SpoolFull, ref.Path)
 			case err != nil:
-				res.Failures = append(res.Failures, id+": spool: "+err.Error())
+				res.Failures = append(res.Failures, ref.Path+": spool: "+err.Error())
 				continue
 			case !r.Skipped:
 				res.Spooled++
 			}
 		}
-		handoff(id) // a no-op copy for archived assets, but it refreshes sidecars
+		handoff(ref) // a no-op copy for archived assets, but it refreshes sidecars
 	}
-	var leftovers []string
+	var leftovers []ingest.AssetRef
 	if err := workflow.ExecuteActivity(quick, acts.NeedsArchive).Get(ctx, &leftovers); err == nil {
-		for _, id := range leftovers {
-			handoff(id)
+		for _, ref := range leftovers {
+			handoff(ref)
 		}
 	}
+	workflow.SetCurrentDetails(ctx, fmt.Sprintf("waiting for %d archive workflows", len(children)))
 	for id, f := range children {
 		var n int
 		if err := f.Get(ctx, &n); err != nil {
@@ -144,40 +149,76 @@ func ImportSource(ctx workflow.Context, root string, q Queues) (*ImportResult, e
 			break
 		}
 	}
+	workflow.SetCurrentDetails(ctx, fmt.Sprintf("%d assets, %d new, %d spooled, %d archived, %d failed; safe to format: %v",
+		res.Assets, res.New, res.Spooled, res.Archived, len(res.Failures), res.SafeToFormat))
 	return res, nil
 }
 
 // startArchive starts (or joins) the ArchiveAsset workflow for an asset.
-func startArchive(ctx workflow.Context, id string, q Queues) workflow.ChildWorkflowFuture {
+// The path is the workflow's summary in the UI, so a list of them reads
+// as filenames rather than identities.
+func startArchive(ctx workflow.Context, ref ingest.AssetRef, q Queues) workflow.ChildWorkflowFuture {
 	cctx := workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
-		WorkflowID:            ArchiveWorkflowID(id),
+		WorkflowID:            ArchiveWorkflowID(ref.ID),
 		TaskQueue:             q.Main,
 		ParentClosePolicy:     enums.PARENT_CLOSE_POLICY_ABANDON,
 		WorkflowIDReusePolicy: enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
+		StaticSummary:         ref.Path,
+		StaticDetails:         fmt.Sprintf("%s, asset %s", fmtBytes(ref.Size), ref.ID),
 	})
-	return workflow.ExecuteChildWorkflow(cctx, ArchiveAsset, id, q)
+	return workflow.ExecuteChildWorkflow(cctx, ArchiveAsset, ref, q)
 }
 
 // ArchiveAsset copies one asset to every NAS lacking it, on the NAS queue,
 // and returns how many copies it made. It is its own workflow so that it
 // survives the import that started it and so two imports of the same
 // content share one copy.
-func ArchiveAsset(ctx workflow.Context, id string, q Queues) (int, error) {
+func ArchiveAsset(ctx workflow.Context, ref ingest.AssetRef, q Queues) (int, error) {
 	var acts *Activities
 	opts := copyOpts
 	opts.TaskQueue = q.NAS
-	actx := workflow.WithActivityOptions(ctx, opts)
+	opts.Summary = ref.Path
+	workflow.SetCurrentDetails(ctx, fmt.Sprintf("copying %s (%s) to the NAS", ref.Path, fmtBytes(ref.Size)))
 	var results []ingest.CopyResult
-	if err := workflow.ExecuteActivity(actx, acts.Archive, id).Get(ctx, &results); err != nil {
+	if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, opts), acts.Archive, ref).Get(ctx, &results); err != nil {
+		workflow.SetCurrentDetails(ctx, "failed: "+err.Error())
 		return 0, err
 	}
 	n := 0
+	var where []string
 	for _, r := range results {
 		if !r.Skipped {
 			n++
+			where = append(where, r.Location)
 		}
 	}
+	switch n {
+	case 0:
+		workflow.SetCurrentDetails(ctx, "already on the NAS; sidecars refreshed")
+	default:
+		workflow.SetCurrentDetails(ctx, fmt.Sprintf("copied to %s", strings.Join(where, ", ")))
+	}
 	return n, nil
+}
+
+// withSummary labels an activity with the file it works on.
+func withSummary(ctx workflow.Context, summary string) workflow.Context {
+	opts := workflow.GetActivityOptions(ctx)
+	opts.Summary = summary
+	return workflow.WithActivityOptions(ctx, opts)
+}
+
+func fmtBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 // BacklogResult is what ArchiveBacklog returns.
@@ -192,15 +233,18 @@ type BacklogResult struct {
 func ArchiveBacklog(ctx workflow.Context, q Queues) (*BacklogResult, error) {
 	var acts *Activities
 	quick := workflow.WithActivityOptions(ctx, quickOpts)
-	var ids []string
-	if err := workflow.ExecuteActivity(quick, acts.NeedsArchive).Get(ctx, &ids); err != nil {
+	var refs []ingest.AssetRef
+	if err := workflow.ExecuteActivity(quick, acts.NeedsArchive).Get(ctx, &refs); err != nil {
 		return nil, err
 	}
-	res := &BacklogResult{Assets: len(ids)}
+	res := &BacklogResult{Assets: len(refs)}
+	var total int64
 	futures := map[string]workflow.ChildWorkflowFuture{}
-	for _, id := range ids {
-		futures[id] = startArchive(ctx, id, q)
+	for _, ref := range refs {
+		futures[ref.ID] = startArchive(ctx, ref, q)
+		total += ref.Size
 	}
+	workflow.SetCurrentDetails(ctx, fmt.Sprintf("waiting for %d archive workflows, %s", len(futures), fmtBytes(total)))
 	for id, f := range futures {
 		var n int
 		if err := f.Get(ctx, &n); err != nil {
@@ -211,6 +255,7 @@ func ArchiveBacklog(ctx workflow.Context, q Queues) (*BacklogResult, error) {
 		}
 		res.Archived += n
 	}
+	workflow.SetCurrentDetails(ctx, fmt.Sprintf("%d of %d archived, %d failed", res.Archived, res.Assets, len(res.Failures)))
 	return res, nil
 }
 

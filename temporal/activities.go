@@ -47,22 +47,22 @@ func (a *Activities) IsArchived(ctx context.Context, id string) (bool, error) {
 }
 
 // Spool copies one asset to a spool, heartbeating as bytes move.
-func (a *Activities) Spool(ctx context.Context, id string) (ingest.CopyResult, error) {
-	r, err := a.Env.SpoolAsset(heartbeating(ctx), id)
+func (a *Activities) Spool(ctx context.Context, ref ingest.AssetRef) (ingest.CopyResult, error) {
+	r, err := a.Env.SpoolAsset(heartbeating(ctx, ref), ref.ID)
 	return r, classify(err)
 }
 
 // Archive copies one asset to every NAS lacking it, heartbeating as bytes
 // move. Workflows run it on the NAS task queue, whose worker caps how many
 // run at once.
-func (a *Activities) Archive(ctx context.Context, id string) ([]ingest.CopyResult, error) {
-	r, err := a.Env.ArchiveAsset(heartbeating(ctx), id)
+func (a *Activities) Archive(ctx context.Context, ref ingest.AssetRef) ([]ingest.CopyResult, error) {
+	r, err := a.Env.ArchiveAsset(heartbeating(ctx, ref), ref.ID)
 	return r, classify(err)
 }
 
 // NeedsArchive lists assets lacking a NAS copy.
-func (a *Activities) NeedsArchive(ctx context.Context) ([]string, error) {
-	return a.Env.NeedsArchiveIDs(ctx)
+func (a *Activities) NeedsArchive(ctx context.Context) ([]ingest.AssetRef, error) {
+	return a.Env.NeedsArchiveRefs(ctx)
 }
 
 // Flush evicts verified spool copies.
@@ -70,11 +70,21 @@ func (a *Activities) Flush(ctx context.Context, spool string, opts ingest.FlushO
 	return a.Env.FlushSpool(ctx, spool, opts)
 }
 
+// Heartbeat is what a copy activity reports as it runs; it shows in the
+// UI as the pending activity's heartbeat details.
+type Heartbeat struct {
+	Path    string
+	Done    int64
+	Total   int64
+	Percent int
+}
+
 // heartbeating forwards copy progress to Temporal so a stalled copy is
-// noticed by the heartbeat timeout and a retried one shows where it was.
-func heartbeating(ctx context.Context) context.Context {
+// noticed by the heartbeat timeout and a running one can be read at a
+// glance.
+func heartbeating(ctx context.Context, ref ingest.AssetRef) context.Context {
 	return ingest.WithProgress(ctx, func(done, total int64) {
-		activity.RecordHeartbeat(ctx, done, total)
+		activity.RecordHeartbeat(ctx, Heartbeat{Path: ref.Path, Done: done, Total: total, Percent: int(done * 100 / max(total, 1))})
 	})
 }
 

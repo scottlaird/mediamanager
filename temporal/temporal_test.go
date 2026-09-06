@@ -216,12 +216,12 @@ func TestSpoolActivityHeartbeats(t *testing.T) {
 	acts := &Activities{Env: f.env}
 	env.RegisterActivity(acts)
 	var beats int
-	var lastDone, lastTotal int64
+	var last Heartbeat
 	env.SetOnActivityHeartbeatListener(func(info *activity.Info, details converter.EncodedValues) {
 		beats++
-		details.Get(&lastDone, &lastTotal)
+		details.Get(&last)
 	})
-	val, err := env.ExecuteActivity(acts.Spool, src.Assets[0])
+	val, err := env.ExecuteActivity(acts.Spool, src.Refs[0])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,8 +230,8 @@ func TestSpoolActivityHeartbeats(t *testing.T) {
 	if r.Location != "fast" || r.Bytes != 3*mib {
 		t.Errorf("result %+v", r)
 	}
-	if beats == 0 || lastDone != lastTotal || lastTotal != 3*mib {
-		t.Errorf("heartbeats %d, last %d/%d", beats, lastDone, lastTotal)
+	if beats == 0 || last.Done != last.Total || last.Total != 3*mib || last.Percent != 100 || last.Path != src.Refs[0].Path {
+		t.Errorf("heartbeats %d, last %+v", beats, last)
 	}
 }
 
