@@ -164,13 +164,34 @@ func (e *Env) treeRel(a catalog.Asset) (string, error) {
 	return path.Join(t.Subdir, a.RelPath), nil
 }
 
-// linkRoot is the link tree for a kind.
-func (e *Env) linkRoot(k media.Kind) (string, bool) {
-	t, ok := e.Config.Tree(k)
-	if !ok {
-		return "", false
+// allKinds is every kind in the order trees are reconciled.
+var allKinds = []media.Kind{media.Video, media.Audio, media.Still}
+
+// linkRoots lists the distinct link tree roots, in kind order. Two kinds
+// configured with the same link share one root.
+func (e *Env) linkRoots() []string {
+	var roots []string
+	seen := map[string]bool{}
+	for _, k := range allKinds {
+		t, ok := e.Config.Tree(k)
+		if !ok || seen[t.Link] {
+			continue
+		}
+		seen[t.Link] = true
+		roots = append(roots, t.Link)
 	}
-	return t.Link, true
+	return roots
+}
+
+// kindsLinkedAt lists the kinds whose link tree is root.
+func (e *Env) kindsLinkedAt(root string) []media.Kind {
+	var kinds []media.Kind
+	for _, k := range allKinds {
+		if t, ok := e.Config.Tree(k); ok && t.Link == root {
+			kinds = append(kinds, k)
+		}
+	}
+	return kinds
 }
 
 func abs(root, rel string) string { return filepath.Join(root, filepath.FromSlash(rel)) }

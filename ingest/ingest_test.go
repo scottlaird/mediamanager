@@ -32,10 +32,18 @@ type fixture struct {
 	env                                   *Env
 }
 
+// audioShared configures audio to live in the video tree, on disk and in
+// the link tree; audioOwn gives it a tree of its own.
+const (
+	audioNone   = ""
+	audioOwn    = "  audio: {link: %[1]s/audio}\n"
+	audioShared = "  audio: {subdir: video, link: %[1]s/video}\n"
+)
+
 // newFixture builds spool, nas and link roots under a temp dir and an Env
-// with absolute-path locations. extra YAML is appended to the location
-// list. Sources are made separately with mkCard.
-func newFixture(t *testing.T, withAudio bool) *fixture {
+// with absolute-path locations. audio is one of the audio* templates.
+// Sources are made separately with mkCard.
+func newFixture(t *testing.T, audio string) *fixture {
 	t.Helper()
 	f := &fixture{base: t.TempDir()}
 	f.spool = filepath.Join(f.base, "spool")
@@ -45,9 +53,8 @@ func newFixture(t *testing.T, withAudio bool) *fixture {
 	for _, d := range []string{f.spool, f.spool2, f.nas} {
 		os.MkdirAll(d, 0o755)
 	}
-	audio := ""
-	if withAudio {
-		audio = fmt.Sprintf("  audio: {link: %s/audio}\n", f.links)
+	if audio != "" {
+		audio = fmt.Sprintf(audio, f.links)
 	}
 	yaml := fmt.Sprintf(`
 catalog: %s/catalog.db
@@ -137,7 +144,7 @@ func sameContent(t *testing.T, a, b string) bool {
 }
 
 func TestImportLifecycle(t *testing.T) {
-	f := newFixture(t, false)
+	f := newFixture(t, audioNone)
 	card := mkCard(t, f.base, "card", map[string]int{
 		"A001_C001.braw":      3 * mib,
 		"A001_C002.braw":      2*mib + 500,
@@ -267,7 +274,7 @@ func TestImportLifecycle(t *testing.T) {
 }
 
 func TestImportStillNameClashAndDuplicateContent(t *testing.T) {
-	f := newFixture(t, false)
+	f := newFixture(t, audioNone)
 	card := mkCard(t, f.base, "card", map[string]int{
 		"DCIM/100_PANA/P1000001.JPG": 50 * 1024, // content A
 		"DCIM/101_PANA/P1000001.JPG": 60 * 1024, // same name, content B
@@ -310,7 +317,7 @@ func TestImportStillNameClashAndDuplicateContent(t *testing.T) {
 }
 
 func TestSpoolResumesPartial(t *testing.T) {
-	f := newFixture(t, false)
+	f := newFixture(t, audioNone)
 	card := mkCard(t, f.base, "card", map[string]int{"A001_C001.braw": 4 * mib}, 3)
 	rel := f.relOf(t, filepath.Join(card, "A001_C001.braw"), media.Video)
 	src, _ := os.ReadFile(filepath.Join(card, "A001_C001.braw"))
@@ -346,7 +353,7 @@ func TestSpoolResumesPartial(t *testing.T) {
 }
 
 func TestSpoolFullArchivesFromSource(t *testing.T) {
-	f := newFixture(t, false)
+	f := newFixture(t, audioNone)
 	old := freeSpace
 	freeSpace = func(string) (int64, error) { return 0, nil }
 	t.Cleanup(func() { freeSpace = old })
@@ -369,7 +376,7 @@ func TestSpoolFullArchivesFromSource(t *testing.T) {
 }
 
 func TestUnmountedLocations(t *testing.T) {
-	f := newFixture(t, false)
+	f := newFixture(t, audioNone)
 	os.RemoveAll(f.spool) // fast spool "not mounted"
 	os.RemoveAll(f.nas)   // NAS not mounted either
 	card := mkCard(t, f.base, "card", map[string]int{"A001_C001.braw": 2 * mib}, 9)
@@ -420,7 +427,7 @@ func TestUnmountedLocations(t *testing.T) {
 }
 
 func TestFlushRefusesCorruptNAS(t *testing.T) {
-	f := newFixture(t, false)
+	f := newFixture(t, audioNone)
 	card := mkCard(t, f.base, "card", map[string]int{"A001_C001.braw": 3 * mib}, 11)
 	rel := f.relOf(t, filepath.Join(card, "A001_C001.braw"), media.Video)
 	if _, err := f.env.Import(ctx, card); err != nil {
@@ -448,7 +455,7 @@ func TestFlushRefusesCorruptNAS(t *testing.T) {
 }
 
 func TestImportStopsOnRealFileInLinkTree(t *testing.T) {
-	f := newFixture(t, false)
+	f := newFixture(t, audioNone)
 	os.MkdirAll(filepath.Join(f.links, "video"), 0o755)
 	os.WriteFile(filepath.Join(f.links, "video", "oops.braw"), []byte("real"), 0o644)
 	card := mkCard(t, f.base, "card", map[string]int{"A001_C001.braw": mib}, 13)
@@ -462,7 +469,7 @@ func TestImportStopsOnRealFileInLinkTree(t *testing.T) {
 }
 
 func TestUnroutedAndOrphanProxies(t *testing.T) {
-	f := newFixture(t, false) // no audio tree
+	f := newFixture(t, audioNone) // no audio tree
 	card := mkCard(t, f.base, "card", map[string]int{
 		"ZOOM0001.WAV":        mib,
 		"Proxy/LONELY.mp4":    1024,
@@ -481,6 +488,90 @@ func TestUnroutedAndOrphanProxies(t *testing.T) {
 	}
 	if len(sum.Source.Assets) != 1 || !sum.SafeToFormat {
 		t.Errorf("summary: %+v", sum)
+	}
+}
+
+func TestAudioSharesVideoTree(t *testing.T) {
+	f := newFixture(t, audioShared)
+	card := mkCard(t, f.base, "card", map[string]int{
+		"A001_C001.braw": 2 * mib,
+		"ZOOM0001.WAV":   mib,
+	}, 21)
+	clip := f.relOf(t, filepath.Join(card, "A001_C001.braw"), media.Video)
+	wav := f.relOf(t, filepath.Join(card, "ZOOM0001.WAV"), media.Audio)
+
+	sum, err := f.env.Import(ctx, card)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sum.Failures) != 0 || len(sum.Source.Unrouted) != 0 || sum.Spooled != 2 || sum.Archived != 2 || !sum.SafeToFormat {
+		t.Fatalf("summary: %+v", sum)
+	}
+	// Both land in the same day directory on every tier and in one link tree.
+	for _, rel := range []string{clip, wav} {
+		for _, root := range []string{f.spool, f.nas} {
+			if !exists(filepath.Join(root, "video", rel)) {
+				t.Errorf("%s missing from %s/video", rel, root)
+			}
+		}
+		if got := readlink(t, filepath.Join(f.links, "video", rel)); got != filepath.Join(f.spool, "video", rel) {
+			t.Errorf("%s -> %s", rel, got)
+		}
+	}
+	if filepath.Dir(clip) != filepath.Dir(wav) {
+		t.Errorf("clip and wav in different directories: %s vs %s", clip, wav)
+	}
+
+	// One reconcile pass for the shared root, and it sees no strays.
+	rep, err := f.env.Relink(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Trees) != 2 { // video+audio share one root; still has its own
+		t.Errorf("reconciled %d roots, want 2: %v", len(rep.Trees), rep.Trees)
+	}
+	shared := rep.Trees[filepath.Join(f.links, "video")]
+	if len(shared.Unknown) != 0 || shared.Unchanged != 2 || len(shared.Updated)+len(shared.Created) != 0 {
+		t.Errorf("shared tree report: %+v", shared)
+	}
+
+	// Flushing moves both links to the NAS; nothing is orphaned or pruned.
+	if _, err := f.env.FlushSpool(ctx, "fast", FlushOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range []string{clip, wav} {
+		if got := readlink(t, filepath.Join(f.links, "video", rel)); got != filepath.Join(f.nas, "video", rel) {
+			t.Errorf("after flush %s -> %s", rel, got)
+		}
+	}
+	if bad, err := linktree.Audit(filepath.Join(f.links, "video")); err != nil {
+		t.Errorf("audit: %v %v", bad, err)
+	}
+}
+
+func TestAudioOwnTreeStaysSeparate(t *testing.T) {
+	f := newFixture(t, audioOwn)
+	card := mkCard(t, f.base, "card", map[string]int{
+		"A001_C001.braw": mib,
+		"ZOOM0001.WAV":   mib,
+	}, 23)
+	if _, err := f.env.Import(ctx, card); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := f.env.Relink(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Trees) != 3 {
+		t.Errorf("reconciled %d roots, want 3", len(rep.Trees))
+	}
+	for root, r := range rep.Trees {
+		if len(r.Unknown) != 0 {
+			t.Errorf("%s: unknown links %v", root, r.Unknown)
+		}
+	}
+	if !exists(filepath.Join(f.nas, "audio", "2026/09/05")) || !exists(filepath.Join(f.links, "audio", "2026/09/05")) {
+		t.Error("audio not in its own tree")
 	}
 }
 

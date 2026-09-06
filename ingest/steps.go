@@ -13,7 +13,6 @@ import (
 	"github.com/scottlaird/mediamanager/copyfile"
 	"github.com/scottlaird/mediamanager/identity"
 	"github.com/scottlaird/mediamanager/linktree"
-	"github.com/scottlaird/mediamanager/media"
 	"github.com/scottlaird/mediamanager/naming"
 )
 
@@ -23,21 +22,23 @@ var ErrSpoolFull = errors.New("ingest: no spool has room")
 // spoolMargin is free space to leave behind after a spool copy.
 const spoolMargin = 256 << 20
 
-// ReconcileReport is what Reconcile changed, per tree.
+// ReconcileReport is what Reconcile changed, per link tree root.
 type ReconcileReport struct {
-	Trees map[media.Kind]linktree.Report
+	Trees map[string]linktree.Report
 	// Unavailable are assets with no usable copy right now (only on an
 	// unplugged card, say). Their existing links are left as they are.
 	Unavailable []string
 }
 
 // Reconcile audits every link tree and then points each asset's link at
-// its best complete copy. It is safe to call at any time and from
-// concurrent steps; calls are serialised.
+// its best complete copy. Kinds configured with the same link root share
+// one tree and are reconciled together, so neither sees the other's links
+// as strays. It is safe to call at any time and from concurrent steps;
+// calls are serialised.
 func (e *Env) Reconcile(ctx context.Context, ps []place) (ReconcileReport, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	rep := ReconcileReport{Trees: map[media.Kind]linktree.Report{}}
+	rep := ReconcileReport{Trees: map[string]linktree.Report{}}
 	srcRoots, err := e.sourceRoots(ctx)
 	if err != nil {
 		return rep, err
@@ -52,43 +53,41 @@ func (e *Env) Reconcile(ctx context.Context, ps []place) (ReconcileReport, error
 		locByID[l.ID] = l
 	}
 
-	for _, kind := range []media.Kind{media.Video, media.Audio, media.Still} {
-		root, ok := e.linkRoot(kind)
-		if !ok {
-			continue
-		}
+	for _, root := range e.linkRoots() {
 		if bad, err := linktree.Audit(root); err != nil {
 			return rep, fmt.Errorf("%w in %s: %v", err, root, bad)
 		}
-		assets, err := e.Catalog.AssetsByKind(ctx, kind)
-		if err != nil {
-			return rep, err
-		}
 		want := map[string]string{}
-		for _, a := range assets {
-			copies, err := e.Catalog.Copies(ctx, a.ID)
+		for _, kind := range e.kindsLinkedAt(root) {
+			assets, err := e.Catalog.AssetsByKind(ctx, kind)
 			if err != nil {
 				return rep, err
 			}
-			target, ok := linktree.Choose(copies, rootOf)
-			if !ok {
-				rep.Unavailable = append(rep.Unavailable, a.ID)
-				continue
-			}
-			want[a.RelPath] = target
-			proxies, err := e.Catalog.Proxies(ctx, a.ID)
-			if err != nil {
-				return rep, err
-			}
-			for ext, target := range bestProxies(proxies, locByID, rootOf) {
-				want[naming.ProxyPath(a.RelPath, ext)] = target
+			for _, a := range assets {
+				copies, err := e.Catalog.Copies(ctx, a.ID)
+				if err != nil {
+					return rep, err
+				}
+				target, ok := linktree.Choose(copies, rootOf)
+				if !ok {
+					rep.Unavailable = append(rep.Unavailable, a.ID)
+					continue
+				}
+				want[a.RelPath] = target
+				proxies, err := e.Catalog.Proxies(ctx, a.ID)
+				if err != nil {
+					return rep, err
+				}
+				for ext, target := range bestProxies(proxies, locByID, rootOf) {
+					want[naming.ProxyPath(a.RelPath, ext)] = target
+				}
 			}
 		}
 		lr, err := linktree.Reconcile(root, want, linktree.Options{})
 		if err != nil {
 			return rep, err
 		}
-		rep.Trees[kind] = lr
+		rep.Trees[root] = lr
 	}
 	return rep, nil
 }
