@@ -6,7 +6,6 @@ import (
 	"sync"
 
 	"github.com/scottlaird/mediamanager/catalog"
-	"github.com/scottlaird/mediamanager/media"
 )
 
 // Failure is one asset that did not finish a step.
@@ -253,7 +252,7 @@ func (e *Env) Status(ctx context.Context) (*Status, error) {
 		}
 		st.Locations = append(st.Locations, ls)
 	}
-	for _, kind := range []media.Kind{media.Video, media.Audio, media.Still} {
+	for _, kind := range allKinds {
 		assets, err := e.Catalog.AssetsByKind(ctx, kind)
 		if err != nil {
 			return nil, err

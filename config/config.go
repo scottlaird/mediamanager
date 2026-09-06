@@ -37,7 +37,9 @@ type Config struct {
 }
 
 // Tree is where one kind's files live inside every location, and where
-// its link tree is.
+// its link tree is. Kinds may share a tree: give them the same Link and
+// Subdir, as when audio from a separate recorder should sit beside the
+// day's video.
 type Tree struct {
 	// Subdir is the directory under each location root. Defaults to the
 	// kind's name.

@@ -182,9 +182,9 @@ func relinkCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			for kind, r := range rep.Trees {
+			for root, r := range rep.Trees {
 				fmt.Printf("%s: %d created, %d updated, %d unchanged, %d unknown links\n",
-					kind, len(r.Created), len(r.Updated), r.Unchanged, len(r.Unknown))
+					root, len(r.Created), len(r.Updated), r.Unchanged, len(r.Unknown))
 				for _, u := range r.Unknown {
 					fmt.Printf("  unknown link: %s\n", u)
 				}
