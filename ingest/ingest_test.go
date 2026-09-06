@@ -848,6 +848,56 @@ func TestList(t *testing.T) {
 	}
 }
 
+func TestArchivePlan(t *testing.T) {
+	f := newFixture(t, audioNone)
+	os.RemoveAll(f.nas) // NAS away during import: everything stays spooled
+	card := mkCard(t, f.base, "card", map[string]int{"A001_C001.braw": 3 * mib, "B001_C001.braw": mib}, 61)
+	if _, err := f.env.Import(ctx, card); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := f.env.ArchivePlan(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan) != 2 || plan[0].Reason != "no NAS is mounted" || plan[0].From == "" {
+		t.Fatalf("plan without NAS: %+v", plan)
+	}
+
+	os.MkdirAll(f.nas, 0o755)
+	// A partial from an interrupted earlier attempt, to be resumed.
+	relA := f.relOf(t, filepath.Join(card, "A001_C001.braw"), media.Video)
+	partial := filepath.Join(f.nas, "video", relA+".partial")
+	os.MkdirAll(filepath.Dir(partial), 0o755)
+	src, _ := os.ReadFile(filepath.Join(card, "A001_C001.braw"))
+	os.WriteFile(partial, src[:mib], 0o644)
+
+	plan, err = f.env.ArchivePlan(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan) != 2 {
+		t.Fatalf("plan = %+v", plan)
+	}
+	for _, it := range plan {
+		if it.Reason != "" || len(it.To) != 1 || it.To[0] != "nas" || !strings.HasPrefix(it.From, f.spool) {
+			t.Errorf("item %+v", it)
+		}
+		if it.Asset.RelPath == relA && it.Resume != mib {
+			t.Errorf("resume = %d, want %d", it.Resume, mib)
+		}
+	}
+	// The plan changed nothing.
+	if exists(filepath.Join(f.nas, "video", relA)) {
+		t.Error("dry run archived")
+	}
+	if sum, err := f.env.ArchiveAll(ctx); err != nil || sum.Archived != 2 {
+		t.Fatalf("archive: %+v, %v", sum, err)
+	}
+	if plan, _ = f.env.ArchivePlan(ctx); len(plan) != 0 {
+		t.Errorf("plan after archive: %+v", plan)
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

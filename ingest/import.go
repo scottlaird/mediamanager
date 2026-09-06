@@ -3,12 +3,15 @@ package ingest
 import (
 	"context"
 	"errors"
+	"os"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
 
 	"github.com/scottlaird/mediamanager/catalog"
+	"github.com/scottlaird/mediamanager/copyfile"
+	"github.com/scottlaird/mediamanager/linktree"
 	"github.com/scottlaird/mediamanager/media"
 )
 
@@ -200,6 +203,72 @@ func (e *Env) ArchiveAll(ctx context.Context) (*Summary, error) {
 		}
 	}
 	return sum, nil
+}
+
+// ArchiveItem is one asset the archive step would act on.
+type ArchiveItem struct {
+	Asset catalog.Asset
+	// From is where the bytes would be read; empty when no complete copy
+	// is mounted, in which case Reason says so and nothing would happen.
+	From string
+	// To lists the NAS locations lacking a complete copy. Resume is bytes
+	// already present in a .partial on the first of them.
+	To     []string
+	Resume int64
+	Reason string
+}
+
+// ArchivePlan reports what ArchiveAll would do, without doing it: every
+// asset lacking a NAS copy, where it would be read from, which NAS
+// locations would receive it, and any partial already on disk to resume.
+func (e *Env) ArchivePlan(ctx context.Context) ([]ArchiveItem, error) {
+	e.init()
+	ps, err := e.places(ctx)
+	if err != nil {
+		return nil, err
+	}
+	srcRoots, err := e.sourceRoots(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rootOf := e.rootOf(ps, srcRoots)
+	assets, err := e.Catalog.NeedsArchive(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var items []ArchiveItem
+	for _, a := range assets {
+		it := ArchiveItem{Asset: a}
+		copies, err := e.Catalog.Copies(ctx, a.ID)
+		if err != nil {
+			return nil, err
+		}
+		if from, ok := linktree.Choose(copies, rootOf); ok {
+			it.From = from
+		}
+		rel, relErr := e.treeRel(a)
+		for _, p := range ps {
+			if !p.mounted || p.cat.Kind != catalog.NAS || hasComplete(copies, p.cat.ID) {
+				continue
+			}
+			it.To = append(it.To, p.cat.Name)
+			if relErr == nil && len(it.To) == 1 {
+				if st, err := os.Stat(abs(p.root, rel) + copyfile.PartialSuffix); err == nil {
+					it.Resume = st.Size()
+				}
+			}
+		}
+		switch {
+		case relErr != nil:
+			it.Reason = relErr.Error()
+		case it.From == "":
+			it.Reason = "no complete copy is mounted"
+		case len(it.To) == 0:
+			it.Reason = "no NAS is mounted"
+		}
+		items = append(items, it)
+	}
+	return items, nil
 }
 
 // FlushSpool is Flush with location resolution done for the caller.
