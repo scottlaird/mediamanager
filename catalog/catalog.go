@@ -533,3 +533,28 @@ func parseKind(s string) media.Kind {
 func isUniqueViolation(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
+
+// AssetsByKind lists every asset in one tree, ordered by relpath, which is
+// what the link tree reconciler walks.
+func (c *DB) AssetsByKind(ctx context.Context, kind media.Kind) ([]Asset, error) {
+	return c.assets(ctx, `SELECT `+assetCols+` FROM assets WHERE kind = ? ORDER BY relpath`, kind.String())
+}
+
+// AllLocations lists every location of every kind.
+func (c *DB) AllLocations(ctx context.Context) ([]Location, error) {
+	rows, err := c.db.QueryContext(ctx,
+		`SELECT id, kind, name, volume_uuid, label, priority, root FROM locations ORDER BY kind, priority, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Location
+	for rows.Next() {
+		l, err := scanLocation(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}

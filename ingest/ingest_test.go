@@ -1,0 +1,497 @@
+package ingest
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"math/rand"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/scottlaird/mediamanager/catalog"
+	"github.com/scottlaird/mediamanager/config"
+	"github.com/scottlaird/mediamanager/identity"
+	"github.com/scottlaird/mediamanager/linktree"
+	"github.com/scottlaird/mediamanager/media"
+	"github.com/scottlaird/mediamanager/naming"
+)
+
+const mib = 1 << 20
+
+var (
+	ctx  = context.Background()
+	shot = time.Date(2026, 9, 5, 14, 0, 0, 0, time.UTC)
+)
+
+type fixture struct {
+	base, card, spool, spool2, nas, links string
+	env                                   *Env
+}
+
+// newFixture builds spool, nas and link roots under a temp dir and an Env
+// with absolute-path locations. extra YAML is appended to the location
+// list. Sources are made separately with mkCard.
+func newFixture(t *testing.T, withAudio bool) *fixture {
+	t.Helper()
+	f := &fixture{base: t.TempDir()}
+	f.spool = filepath.Join(f.base, "spool")
+	f.spool2 = filepath.Join(f.base, "spool2")
+	f.nas = filepath.Join(f.base, "nas")
+	f.links = filepath.Join(f.base, "links")
+	for _, d := range []string{f.spool, f.spool2, f.nas} {
+		os.MkdirAll(d, 0o755)
+	}
+	audio := ""
+	if withAudio {
+		audio = fmt.Sprintf("  audio: {link: %s/audio}\n", f.links)
+	}
+	yaml := fmt.Sprintf(`
+catalog: %s/catalog.db
+timezone: UTC
+trees:
+  video: {link: %s/video}
+  still: {subdir: stills, link: %s/still}
+%s
+locations:
+  - {name: nas, kind: nas, path: %s}
+  - {name: fast, kind: spool, path: %s, priority: 1}
+  - {name: slow, kind: spool, path: %s, priority: 2}
+`, f.base, f.links, f.links, audio, f.nas, f.spool, f.spool2)
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cat, err := catalog.Open(cfg.Catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cat.Close() })
+	f.env = &Env{Config: cfg, Catalog: cat, Logf: t.Logf}
+	return f
+}
+
+// mkCard writes files (rel → size) under a new source dir, with fixed
+// mtimes so capture dates are predictable. Content is seeded by name so
+// identical names in different cards mean identical content unless the
+// seed is varied.
+func mkCard(t *testing.T, base, name string, files map[string]int, seed int64) string {
+	t.Helper()
+	root := filepath.Join(base, name)
+	for rel, n := range files {
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		b := make([]byte, n)
+		h := int64(0)
+		for _, c := range rel {
+			h = h*31 + int64(c)
+		}
+		rand.New(rand.NewSource(h ^ seed)).Read(b)
+		if err := os.WriteFile(p, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		os.Chtimes(p, shot, shot)
+	}
+	return root
+}
+
+func (f *fixture) relOf(t *testing.T, cardPath string, kind media.Kind) string {
+	t.Helper()
+	na := naming.Asset{Kind: kind, OrigName: filepath.Base(cardPath), CaptureTime: shot}
+	if kind.UsesSparseID() {
+		id, _, err := identity.SparseFile(cardPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		na.ID = id
+	}
+	rel, err := naming.DateScheme{}.Path(na)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rel
+}
+
+func readlink(t *testing.T, p string) string {
+	t.Helper()
+	s, err := os.Readlink(p)
+	if err != nil {
+		t.Fatalf("readlink %s: %v", p, err)
+	}
+	return s
+}
+
+func exists(p string) bool { _, err := os.Stat(p); return err == nil }
+
+func sameContent(t *testing.T, a, b string) bool {
+	t.Helper()
+	x, err1 := os.ReadFile(a)
+	y, err2 := os.ReadFile(b)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return bytes.Equal(x, y)
+}
+
+func TestImportLifecycle(t *testing.T) {
+	f := newFixture(t, false)
+	card := mkCard(t, f.base, "card", map[string]int{
+		"A001_C001.braw":      3 * mib,
+		"A001_C002.braw":      2*mib + 500,
+		"Proxy/A001_C001.mp4": 64 * 1024,
+		"Proxy/A001_C002.mp4": 64 * 1024,
+		".DS_Store":           10,
+		"notes.txt":           10,
+		"DCIM-less-still.DNG": 100 * 1024,
+	}, 1)
+	c1 := f.relOf(t, filepath.Join(card, "A001_C001.braw"), media.Video)
+	c2 := f.relOf(t, filepath.Join(card, "A001_C002.braw"), media.Video)
+	still := "2026/09/05/dcim-less-still.dng"
+
+	sum, err := f.env.Import(ctx, card)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sum.Failures) != 0 {
+		t.Fatalf("failures: %+v", sum.Failures)
+	}
+	if len(sum.Source.Assets) != 3 || len(sum.Source.New) != 3 || sum.Spooled != 3 || sum.Archived != 3 || !sum.SafeToFormat {
+		t.Errorf("summary: assets=%d new=%d spooled=%d archived=%d safe=%v", len(sum.Source.Assets), len(sum.Source.New), sum.Spooled, sum.Archived, sum.SafeToFormat)
+	}
+	if !equalStrings(sum.Source.Unrecognised, []string{"notes.txt"}) {
+		t.Errorf("unrecognised = %v", sum.Source.Unrecognised)
+	}
+
+	// Files where they should be, on both tiers, byte-identical.
+	for _, rel := range []string{"video/" + c1, "video/" + c2, "stills/" + still, "video/" + naming.ProxyPath(c1, "mp4")} {
+		for _, root := range []string{f.spool, f.nas} {
+			if !exists(filepath.Join(root, rel)) {
+				t.Errorf("%s missing from %s", rel, root)
+			}
+		}
+	}
+	if !sameContent(t, filepath.Join(card, "A001_C001.braw"), filepath.Join(f.nas, "video", c1)) {
+		t.Error("NAS copy differs from card")
+	}
+	// Links point at the fast spool.
+	if got := readlink(t, filepath.Join(f.links, "video", c1)); got != filepath.Join(f.spool, "video", c1) {
+		t.Errorf("link -> %s", got)
+	}
+	if got := readlink(t, filepath.Join(f.links, "video", naming.ProxyPath(c2, "mp4"))); got != filepath.Join(f.spool, "video", naming.ProxyPath(c2, "mp4")) {
+		t.Errorf("proxy link -> %s", got)
+	}
+	if got := readlink(t, filepath.Join(f.links, "still", still)); got != filepath.Join(f.spool, "stills", still) {
+		t.Errorf("still link -> %s", got)
+	}
+	if bad, err := linktree.Audit(filepath.Join(f.links, "video")); err != nil {
+		t.Errorf("audit: %v %v", bad, err)
+	}
+	// Nothing spooled to the slow spool.
+	if entries, _ := os.ReadDir(f.spool2); len(entries) != 0 {
+		t.Errorf("slow spool used: %v", entries)
+	}
+
+	// Second import: everything known, nothing copied, nothing rewritten.
+	before, _ := os.Stat(filepath.Join(f.nas, "video", c1))
+	sum, err = f.env.Import(ctx, card)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sum.Source.New) != 0 || sum.Spooled != 0 || sum.Archived != 0 || !sum.SafeToFormat || len(sum.Failures) != 0 {
+		t.Errorf("second import: new=%d spooled=%d archived=%d safe=%v fail=%v", len(sum.Source.New), sum.Spooled, sum.Archived, sum.SafeToFormat, sum.Failures)
+	}
+	after, _ := os.Stat(filepath.Join(f.nas, "video", c1))
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Error("NAS file rewritten on re-import")
+	}
+
+	st, err := f.env.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, as := range st.Assets {
+		if as.State != "archived" {
+			t.Errorf("%s state %s, want archived (%v)", as.Asset.RelPath, as.State, as.Copies)
+		}
+	}
+
+	// Flush: dry run first, then for real.
+	dry, err := f.env.FlushSpool(ctx, "fast", FlushOptions{DryRun: true})
+	if err != nil || len(dry.Flushed) != 3 || len(dry.Refused) != 0 {
+		t.Fatalf("dry run: %+v, %v", dry, err)
+	}
+	if !exists(filepath.Join(f.spool, "video", c1)) {
+		t.Fatal("dry run deleted")
+	}
+	rep, err := f.env.FlushSpool(ctx, "fast", FlushOptions{})
+	if err != nil || len(rep.Flushed) != 3 || len(rep.Refused) != 0 {
+		t.Fatalf("flush: %+v, %v", rep, err)
+	}
+	for _, rel := range []string{"video/" + c1, "video/" + naming.ProxyPath(c1, "mp4"), "stills/" + still} {
+		if exists(filepath.Join(f.spool, rel)) {
+			t.Errorf("%s still in spool after flush", rel)
+		}
+		if !exists(filepath.Join(f.nas, rel)) {
+			t.Errorf("%s gone from NAS after flush", rel)
+		}
+	}
+	if got := readlink(t, filepath.Join(f.links, "video", c1)); got != filepath.Join(f.nas, "video", c1) {
+		t.Errorf("after flush link -> %s", got)
+	}
+	if got := readlink(t, filepath.Join(f.links, "video", naming.ProxyPath(c1, "mp4"))); got != filepath.Join(f.nas, "video", naming.ProxyPath(c1, "mp4")) {
+		t.Errorf("after flush proxy link -> %s", got)
+	}
+	st, _ = f.env.Status(ctx)
+	for _, as := range st.Assets {
+		if as.State != "flushed" {
+			t.Errorf("%s state %s after flush", as.Asset.RelPath, as.State)
+		}
+	}
+
+	// Card pulled: links unaffected, re-import of the same card later is a no-op.
+	os.RemoveAll(card)
+	if _, err := f.env.Relink(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := readlink(t, filepath.Join(f.links, "video", c1)); got != filepath.Join(f.nas, "video", c1) {
+		t.Errorf("after unplug link -> %s", got)
+	}
+	card = mkCard(t, f.base, "card", map[string]int{"A001_C001.braw": 3 * mib}, 1)
+	sum, err = f.env.Import(ctx, card)
+	if err != nil || sum.Spooled != 0 || sum.Archived != 0 || !sum.SafeToFormat {
+		t.Errorf("re-import after flush: %+v, %v", sum, err)
+	}
+}
+
+func TestImportStillNameClashAndDuplicateContent(t *testing.T) {
+	f := newFixture(t, false)
+	card := mkCard(t, f.base, "card", map[string]int{
+		"DCIM/100_PANA/P1000001.JPG": 50 * 1024, // content A
+		"DCIM/101_PANA/P1000001.JPG": 60 * 1024, // same name, content B
+		"DCIM/102_PANA/P1000001.JPG": 50 * 1024, // overwritten below with A
+		"DCIM/102_PANA/ZDUP.JPG":     50 * 1024, // overwritten below with A
+	}, 7)
+	src, _ := os.ReadFile(filepath.Join(card, "DCIM/100_PANA/P1000001.JPG"))
+	for _, dup := range []string{"DCIM/102_PANA/P1000001.JPG", "DCIM/102_PANA/ZDUP.JPG"} {
+		p := filepath.Join(card, dup)
+		os.WriteFile(p, src, 0o644)
+		os.Chtimes(p, shot, shot)
+	}
+	sum, err := f.env.Import(ctx, card)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sum.Failures) != 0 {
+		t.Fatalf("failures: %+v", sum.Failures)
+	}
+	// Four files, two distinct contents: two assets, the clash gets _1,
+	// duplicates are recorded as extra source copies of the first asset.
+	if len(sum.Source.Assets) != 4 || len(sum.Source.New) != 2 || sum.Spooled != 2 || sum.Archived != 2 {
+		t.Errorf("assets=%d new=%d spooled=%d archived=%d", len(sum.Source.Assets), len(sum.Source.New), sum.Spooled, sum.Archived)
+	}
+	for _, rel := range []string{"stills/2026/09/05/p1000001.jpg", "stills/2026/09/05/p1000001_1.jpg"} {
+		if !exists(filepath.Join(f.nas, rel)) {
+			t.Errorf("%s missing from NAS", rel)
+		}
+	}
+	if exists(filepath.Join(f.nas, "stills/2026/09/05/zdup.jpg")) {
+		t.Error("duplicate content got its own file")
+	}
+	entries, _ := os.ReadDir(filepath.Join(f.nas, "stills/2026/09/05"))
+	if len(entries) != 2 {
+		t.Errorf("NAS day dir has %d entries, want 2", len(entries))
+	}
+	if !sum.SafeToFormat {
+		t.Error("not safe to format after full import")
+	}
+}
+
+func TestSpoolResumesPartial(t *testing.T) {
+	f := newFixture(t, false)
+	card := mkCard(t, f.base, "card", map[string]int{"A001_C001.braw": 4 * mib}, 3)
+	rel := f.relOf(t, filepath.Join(card, "A001_C001.braw"), media.Video)
+	src, _ := os.ReadFile(filepath.Join(card, "A001_C001.braw"))
+	partial := filepath.Join(f.spool, "video", rel+".partial")
+	os.MkdirAll(filepath.Dir(partial), 0o755)
+	os.WriteFile(partial, src[:3*mib], 0o644)
+
+	ps, err := f.env.places(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srcInfo, err := f.env.ScanSource(ctx, card)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := f.env.Spool(ctx, ps, srcInfo.Assets[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Resumed != 3*mib || r.Bytes != 4*mib || r.Location != "fast" {
+		t.Errorf("result %+v", r)
+	}
+	if !sameContent(t, filepath.Join(card, "A001_C001.braw"), filepath.Join(f.spool, "video", rel)) {
+		t.Error("resumed copy differs")
+	}
+	if got := readlink(t, filepath.Join(f.links, "video", rel)); got != filepath.Join(f.spool, "video", rel) {
+		t.Errorf("link -> %s", got)
+	}
+	// Spooling again is a no-op.
+	if r, err := f.env.Spool(ctx, ps, srcInfo.Assets[0]); err != nil || !r.Skipped {
+		t.Errorf("second spool: %+v, %v", r, err)
+	}
+}
+
+func TestSpoolFullArchivesFromSource(t *testing.T) {
+	f := newFixture(t, false)
+	old := freeSpace
+	freeSpace = func(string) (int64, error) { return 0, nil }
+	t.Cleanup(func() { freeSpace = old })
+
+	card := mkCard(t, f.base, "card", map[string]int{"A001_C001.braw": 2 * mib}, 5)
+	rel := f.relOf(t, filepath.Join(card, "A001_C001.braw"), media.Video)
+	sum, err := f.env.Import(ctx, card)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sum.SpoolFull) != 1 || sum.Spooled != 0 || sum.Archived != 1 || len(sum.Failures) != 0 || !sum.SafeToFormat {
+		t.Errorf("summary: %+v", sum)
+	}
+	if exists(filepath.Join(f.spool, "video", rel)) {
+		t.Error("spooled despite no room")
+	}
+	if got := readlink(t, filepath.Join(f.links, "video", rel)); got != filepath.Join(f.nas, "video", rel) {
+		t.Errorf("link -> %s, want NAS", got)
+	}
+}
+
+func TestUnmountedLocations(t *testing.T) {
+	f := newFixture(t, false)
+	os.RemoveAll(f.spool) // fast spool "not mounted"
+	os.RemoveAll(f.nas)   // NAS not mounted either
+	card := mkCard(t, f.base, "card", map[string]int{"A001_C001.braw": 2 * mib}, 9)
+	rel := f.relOf(t, filepath.Join(card, "A001_C001.braw"), media.Video)
+
+	sum, err := f.env.Import(ctx, card)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Spooled != 1 || sum.Archived != 0 || sum.SafeToFormat || len(sum.Failures) != 0 {
+		t.Errorf("summary: spooled=%d archived=%d safe=%v fail=%v", sum.Spooled, sum.Archived, sum.SafeToFormat, sum.Failures)
+	}
+	if !exists(filepath.Join(f.spool2, "video", rel)) {
+		t.Error("slow spool not used when fast is absent")
+	}
+	if got := readlink(t, filepath.Join(f.links, "video", rel)); got != filepath.Join(f.spool2, "video", rel) {
+		t.Errorf("link -> %s", got)
+	}
+	st, _ := f.env.Status(ctx)
+	if st.Locations[0].Mounted || !st.Locations[2].Mounted {
+		t.Errorf("locations: %+v", st.Locations)
+	}
+	// Flushing an unmounted spool, or with the NAS away, must refuse.
+	if _, err := f.env.FlushSpool(ctx, "fast", FlushOptions{}); err == nil {
+		t.Error("flushed an unmounted spool")
+	}
+	rep, err := f.env.FlushSpool(ctx, "slow", FlushOptions{})
+	if err != nil || len(rep.Flushed) != 0 {
+		t.Errorf("flush without NAS: %+v, %v", rep, err)
+	}
+	if !exists(filepath.Join(f.spool2, "video", rel)) {
+		t.Fatal("spool copy deleted with no NAS copy anywhere")
+	}
+
+	// NAS comes back: ArchiveAll drains the backlog, then flush works.
+	os.MkdirAll(f.nas, 0o755)
+	as, err := f.env.ArchiveAll(ctx)
+	if err != nil || as.Archived != 1 {
+		t.Fatalf("ArchiveAll: %+v, %v", as, err)
+	}
+	rep, err = f.env.FlushSpool(ctx, "slow", FlushOptions{})
+	if err != nil || len(rep.Flushed) != 1 {
+		t.Fatalf("flush after archive: %+v, %v", rep, err)
+	}
+	if got := readlink(t, filepath.Join(f.links, "video", rel)); got != filepath.Join(f.nas, "video", rel) {
+		t.Errorf("link -> %s", got)
+	}
+}
+
+func TestFlushRefusesCorruptNAS(t *testing.T) {
+	f := newFixture(t, false)
+	card := mkCard(t, f.base, "card", map[string]int{"A001_C001.braw": 3 * mib}, 11)
+	rel := f.relOf(t, filepath.Join(card, "A001_C001.braw"), media.Video)
+	if _, err := f.env.Import(ctx, card); err != nil {
+		t.Fatal(err)
+	}
+	nasFile := filepath.Join(f.nas, "video", rel)
+	b, _ := os.ReadFile(nasFile)
+	os.WriteFile(nasFile, b[:len(b)-1], 0o644) // truncated after the fact
+
+	rep, err := f.env.FlushSpool(ctx, "fast", FlushOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Flushed) != 0 || len(rep.Refused) != 1 {
+		t.Errorf("flush: %+v", rep)
+	}
+	for _, reason := range rep.Refused {
+		if !strings.Contains(reason, "bytes") {
+			t.Errorf("reason %q", reason)
+		}
+	}
+	if !exists(filepath.Join(f.spool, "video", rel)) {
+		t.Fatal("spool copy deleted despite bad NAS copy")
+	}
+}
+
+func TestImportStopsOnRealFileInLinkTree(t *testing.T) {
+	f := newFixture(t, false)
+	os.MkdirAll(filepath.Join(f.links, "video"), 0o755)
+	os.WriteFile(filepath.Join(f.links, "video", "oops.braw"), []byte("real"), 0o644)
+	card := mkCard(t, f.base, "card", map[string]int{"A001_C001.braw": mib}, 13)
+	_, err := f.env.Import(ctx, card)
+	if !errors.Is(err, linktree.ErrRealFiles) {
+		t.Fatalf("err = %v, want ErrRealFiles", err)
+	}
+	if entries, _ := os.ReadDir(f.spool); len(entries) != 0 {
+		t.Error("copied despite failed audit")
+	}
+}
+
+func TestUnroutedAndOrphanProxies(t *testing.T) {
+	f := newFixture(t, false) // no audio tree
+	card := mkCard(t, f.base, "card", map[string]int{
+		"ZOOM0001.WAV":        mib,
+		"Proxy/LONELY.mp4":    1024,
+		"A001_C001.braw":      mib,
+		"Proxy/A001_C001.mp4": 1024,
+	}, 17)
+	sum, err := f.env.Import(ctx, card)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equalStrings(sum.Source.Unrouted, []string{"ZOOM0001.WAV"}) {
+		t.Errorf("unrouted = %v", sum.Source.Unrouted)
+	}
+	if !equalStrings(sum.Source.OrphanProxies, []string{"Proxy/LONELY.mp4"}) {
+		t.Errorf("orphan proxies = %v", sum.Source.OrphanProxies)
+	}
+	if len(sum.Source.Assets) != 1 || !sum.SafeToFormat {
+		t.Errorf("summary: %+v", sum)
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
