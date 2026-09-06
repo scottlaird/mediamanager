@@ -730,6 +730,50 @@ func TestEditorCreatedSidecarsAreSwept(t *testing.T) {
 	}
 }
 
+func TestTreeAtLocationRoot(t *testing.T) {
+	f := newFixture(t, audioNone)
+	tr := f.env.Config.Trees["video"]
+	tr.Subdir = "."
+	f.env.Config.Trees["video"] = tr
+	// An existing spool holding clips at its root, like /Volumes/m2/2026/...
+	old := filepath.Join(f.spool, "2026", "A021_07100435_C001.braw")
+	os.MkdirAll(filepath.Dir(old), 0o755)
+	os.WriteFile(old, bytes.Repeat([]byte("m2"), mib), 0o644)
+	os.Chtimes(old, shot, shot)
+	rel := f.relOf(t, old, media.Video)
+
+	rep, err := f.env.Adopt(ctx, "fast", AdoptOptions{Mode: Migrate})
+	if err != nil || rep.Counts["rename"] != 1 {
+		t.Fatalf("adopt: %v, %v", rep.Counts, err)
+	}
+	if !exists(filepath.Join(f.spool, rel)) || exists(old) {
+		t.Fatalf("migrate at root: %s not at %s", old, rel)
+	}
+	if got := readlink(t, filepath.Join(f.links, "video", rel)); got != filepath.Join(f.spool, rel) {
+		t.Errorf("link -> %s", got)
+	}
+	// Archive lands it at the NAS root under the same relpath; flush then works.
+	sum, err := f.env.ArchiveAll(ctx)
+	if err != nil || sum.Archived != 1 || !exists(filepath.Join(f.nas, rel)) {
+		t.Fatalf("archive: %+v, %v", sum, err)
+	}
+	fr, err := f.env.FlushSpool(ctx, "fast", FlushOptions{})
+	if err != nil || len(fr.Flushed) != 1 {
+		t.Fatalf("flush: %+v, %v", fr, err)
+	}
+	if got := readlink(t, filepath.Join(f.links, "video", rel)); got != filepath.Join(f.nas, rel) {
+		t.Errorf("after flush link -> %s", got)
+	}
+	// The stills tree keeps its own subdir alongside.
+	card := mkCard(t, f.base, "card", map[string]int{"L1.DNG": 4096}, 3)
+	if _, err := f.env.Import(ctx, card); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(filepath.Join(f.nas, "stills", "2026/09/05/l1.dng")) {
+		t.Error("stills tree lost its subdir")
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

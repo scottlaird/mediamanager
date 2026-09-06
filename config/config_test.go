@@ -92,6 +92,7 @@ func TestParseErrors(t *testing.T) {
 		{"tree without link", "trees: {video: {}}\nlocations: [{name: n, kind: nas, path: /n}]", "link is required"},
 		{"relative link", "trees: {video: {link: rel}}\nlocations: [{name: n, kind: nas, path: /n}]", "must be absolute"},
 		{"nested subdir", "trees: {video: {subdir: a/b, link: /x}}\nlocations: [{name: n, kind: nas, path: /n}]", "single directory"},
+		{"parent subdir", "trees: {video: {subdir: .., link: /x}}\nlocations: [{name: n, kind: nas, path: /n}]", "single directory"},
 		{"no locations", "trees: {video: {link: /x}}", "no locations"},
 		{"dup names", base(func(s string) string { return strings.Replace(s, "name: slow", "name: nas", 1) }), "duplicate"},
 		{"bad kind", base(func(s string) string { return strings.Replace(s, "kind: nas", "kind: tape", 1) }), "spool or nas"},
@@ -109,6 +110,16 @@ func TestParseErrors(t *testing.T) {
 		if !strings.Contains(err.Error(), tt.want) {
 			t.Errorf("%s: error %q does not mention %q", tt.name, err, tt.want)
 		}
+	}
+}
+
+func TestRootSubdir(t *testing.T) {
+	c, err := Parse([]byte("trees: {video: {subdir: ., link: /v}}\nlocations: [{name: n, kind: nas, path: /n}]"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr, _ := c.Tree(media.Video); tr.Subdir != "." {
+		t.Errorf("subdir = %q", tr.Subdir)
 	}
 }
 
