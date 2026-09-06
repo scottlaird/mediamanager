@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"text/tabwriter"
@@ -295,4 +296,94 @@ func volumeCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func adoptCmd() *cobra.Command {
+	var (
+		mode   string
+		dryRun bool
+	)
+	cmd := &cobra.Command{
+		Use:   "adopt <location>",
+		Short: "Bring files already on a spool or NAS under management",
+		Long: `Adopt scans each configured tree under the location and catalogues what it
+finds. With --mode in-place (the default) nothing on disk changes: files keep
+their names and paths and are linked as they are. With --mode migrate they
+are renamed on the same volume into the tool's layout and naming, proxies
+and sidecars alongside; nothing is ever copied, overwritten or deleted, and
+duplicates, unrecognised files and empty folders are reported and left
+where they are.
+
+Run with --dry-run first and read the plan; migrate is a one-off that
+deliberately renames things on the NAS.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			opts := ingest.AdoptOptions{DryRun: dryRun}
+			switch mode {
+			case "in-place":
+				opts.Mode = ingest.InPlace
+			case "migrate":
+				opts.Mode = ingest.Migrate
+			default:
+				return fmt.Errorf("--mode must be in-place or migrate, not %q", mode)
+			}
+			env, done, err := openEnv()
+			if err != nil {
+				return err
+			}
+			defer done()
+			rep, err := env.Adopt(cmd.Context(), args[0], opts)
+			if rep != nil {
+				printAdopt(os.Stdout, rep)
+				if !rep.DryRun && len(rep.Actions) > 0 {
+					if p, lerr := writeAdoptLog(env.Config.Catalog, rep); lerr == nil {
+						fmt.Printf("plan written to %s\n", p)
+					}
+				}
+			}
+			return err
+		},
+	}
+	cmd.Flags().StringVar(&mode, "mode", "in-place", "in-place or migrate")
+	cmd.Flags().BoolVarP(&dryRun, "dry-run", "n", false, "show the plan without cataloguing or renaming")
+	return cmd
+}
+
+func printAdopt(w io.Writer, rep *ingest.AdoptReport) {
+	verb := "adopted"
+	if rep.DryRun {
+		verb = "would adopt"
+	}
+	tw := tabwriter.NewWriter(w, 2, 4, 2, ' ', 0)
+	for _, a := range rep.Actions {
+		to := ""
+		if a.To != "" {
+			to = "-> " + a.To
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", a.Op, a.From, to, a.Note)
+	}
+	tw.Flush()
+	fmt.Fprintf(w, "\n%s (%s): %d originals, %s", rep.Location, rep.Mode, rep.Counts["adopt"]+rep.Counts["rename"], humanSize(rep.Bytes))
+	for _, op := range []string{"rename", "known", "companion", "duplicate", "orphan", "unrecognised", "unrouted", "conflict", "empty-dir", "date-mismatch"} {
+		if n := rep.Counts[op]; n > 0 {
+			fmt.Fprintf(w, ", %d %s", n, op)
+		}
+	}
+	fmt.Fprintf(w, " (%s)\n", verb)
+}
+
+// writeAdoptLog keeps the plan beside the catalog, since a migrate renames
+// files and the old names are otherwise gone.
+func writeAdoptLog(catalogPath string, rep *ingest.AdoptReport) (string, error) {
+	p := filepath.Join(filepath.Dir(catalogPath), "adopt-"+time.Now().Format("20060102-150405")+".log")
+	f, err := os.Create(p)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "# mm adopt %s --mode %s, %s\n", rep.Location, rep.Mode, time.Now().Format(time.RFC3339))
+	for _, a := range rep.Actions {
+		fmt.Fprintf(f, "%s\t%s\t%s\t%s\t%s\n", a.Op, a.From, a.To, a.AssetID, a.Note)
+	}
+	return p, nil
 }
