@@ -8,13 +8,16 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/scottlaird/mediamanager/catalog"
 	"github.com/scottlaird/mediamanager/copyfile"
 	"github.com/scottlaird/mediamanager/identity"
 	"github.com/scottlaird/mediamanager/linktree"
+	"github.com/scottlaird/mediamanager/media"
 	"github.com/scottlaird/mediamanager/naming"
+	"github.com/scottlaird/mediamanager/scan"
 )
 
 // ErrSpoolFull means no mounted spool has room for the asset.
@@ -55,7 +58,14 @@ func (e *Env) Reconcile(ctx context.Context, ps []place) (ReconcileReport, error
 	}
 
 	for _, root := range e.linkRoots() {
-		if bad, err := linktree.Audit(root); err != nil {
+		bad, err := linktree.Audit(root)
+		if errors.Is(err, linktree.ErrRealFiles) {
+			if err = e.sweepSidecars(ctx, root, bad, rootOf); err != nil {
+				return rep, err
+			}
+			bad, err = linktree.Audit(root)
+		}
+		if err != nil {
 			return rep, fmt.Errorf("%w in %s: %v", err, root, bad)
 		}
 		want := map[string]string{}
@@ -103,9 +113,9 @@ type companionKey struct {
 func companionPath(rel string, role catalog.Role, ext string) string {
 	switch role {
 	case catalog.RoleSidecar:
-		return naming.SidecarPath(rel)
+		return naming.SidecarPath(rel, ext)
 	case catalog.RoleProxySidecar:
-		return naming.ProxySidecarPath(rel)
+		return naming.ProxySidecarPath(rel, ext)
 	default:
 		return naming.ProxyPath(rel, ext)
 	}
@@ -596,4 +606,126 @@ func (e *Env) sidecarSafeOnNAS(ctx context.Context, a catalog.Asset, c catalog.C
 		return true
 	}
 	return false
+}
+
+// sweepSidecars handles the one kind of real file that legitimately turns
+// up in a link tree: a sidecar an editor just created beside the link it
+// opened (Resolve's .sidecar, Lightroom's .xmp). Each is moved into storage
+// beside the copy the link points at, recorded as a companion, and then
+// linked like any other by the reconcile that follows. Any other real file
+// is left for the audit to reject.
+func (e *Env) sweepSidecars(ctx context.Context, root string, offenders []string, rootOf func(catalog.Location) (string, bool)) error {
+	for _, rel := range offenders {
+		ext := strings.ToLower(strings.TrimPrefix(path.Ext(rel), "."))
+		if !scan.IsSidecarExt(ext) {
+			continue
+		}
+		a, role, ok, err := e.sidecarOwner(ctx, root, rel)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue // no sibling link; the audit will report it
+		}
+		copies, err := e.Catalog.Copies(ctx, a.ID)
+		if err != nil {
+			return err
+		}
+		var dest *catalog.Copy
+		for i := range copies {
+			if copies[i].State == catalog.Complete {
+				if _, mounted := rootOf(copies[i].Location); mounted && copies[i].Location.Kind != catalog.Source {
+					dest = &copies[i]
+					break
+				}
+			}
+		}
+		if dest == nil {
+			e.logf("warning: %s: no spool or NAS copy of %s is mounted; sidecar left in place", rel, a.RelPath)
+			continue
+		}
+		t, _ := e.Config.Tree(a.Kind)
+		destRoot, _ := rootOf(dest.Location)
+		destRel := path.Join(t.Subdir, companionPath(a.RelPath, role, ext))
+		src := abs(root, rel)
+		if _, err := replaceIfDifferent(src, abs(destRoot, destRel)); err != nil {
+			return fmt.Errorf("sweeping %s: %w", rel, err)
+		}
+		if err := os.Remove(src); err != nil {
+			return err
+		}
+		sum, _ := identity.FullFile(abs(destRoot, destRel))
+		if err := e.Catalog.PutCompanion(ctx, catalog.Companion{AssetID: a.ID, LocationID: dest.LocationID, Role: role, Ext: ext, RelPath: destRel, SHA256: sum}); err != nil {
+			return err
+		}
+		e.logf("swept %s into %s", rel, dest.Location.Name)
+	}
+	return nil
+}
+
+// sidecarOwner finds the asset a stray sidecar belongs to: the link beside
+// it (same directory, same base) resolves to an asset path, or for a file
+// under Proxy/, the proxy link beside it does.
+func (e *Env) sidecarOwner(ctx context.Context, root, rel string) (catalog.Asset, catalog.Role, bool, error) {
+	dir, name := path.Split(rel)
+	base := strings.TrimSuffix(name, path.Ext(name))
+	role := catalog.RoleSidecar
+	assetDir := dir
+	if strings.EqualFold(path.Base(path.Clean(dir)), "proxy") {
+		role = catalog.RoleProxySidecar
+		assetDir = path.Dir(path.Clean(dir)) + "/"
+		if assetDir == "./" {
+			assetDir = ""
+		}
+	}
+	entries, err := os.ReadDir(abs(root, assetDir))
+	if err != nil {
+		return catalog.Asset{}, "", false, err
+	}
+	var candidates []catalog.Asset
+	for _, ent := range entries {
+		if ent.Type()&os.ModeSymlink == 0 {
+			continue
+		}
+		n := ent.Name()
+		if strings.TrimSuffix(n, path.Ext(n)) != base {
+			continue
+		}
+		for _, kind := range e.kindsLinkedAt(root) {
+			if a, err := e.Catalog.AssetByPath(ctx, kind, path.Join(assetDir, n)); err == nil {
+				candidates = append(candidates, a)
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return catalog.Asset{}, "", false, nil
+	}
+	return preferredOwner(candidates, strings.ToLower(strings.TrimPrefix(path.Ext(name), "."))), role, true, nil
+}
+
+// preferredOwner picks which of several same-base originals a sidecar
+// belongs to: .sidecar goes with video, .xmp with a raw still before a
+// JPEG, and otherwise the first candidate.
+func preferredOwner(cands []catalog.Asset, ext string) catalog.Asset {
+	score := func(a catalog.Asset) int {
+		aext := strings.ToLower(strings.TrimPrefix(path.Ext(a.RelPath), "."))
+		switch {
+		case ext == "sidecar" && a.Kind == media.Video:
+			return 3
+		case ext == "xmp" && a.Kind == media.Still && aext != "jpg" && aext != "jpeg":
+			return 3
+		case ext == "xmp" && a.Kind == media.Still:
+			return 2
+		case a.Kind == media.Video:
+			return 1
+		}
+		return 0
+	}
+	best := cands[0]
+	for _, c := range cands[1:] {
+		if score(c) > score(best) {
+			best = c
+		}
+	}
+	return best
 }

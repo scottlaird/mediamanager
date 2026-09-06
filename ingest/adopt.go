@@ -194,7 +194,7 @@ func (ad *adopter) walk(subdir, root string) error {
 		}
 		return originals[i].Rel < originals[j].Rel
 	})
-	byKey := map[string]planned{}
+	byKey := map[string][]planned{}
 	for _, f := range originals {
 		if err := ad.ctx.Err(); err != nil {
 			return err
@@ -204,17 +204,31 @@ func (ad *adopter) walk(subdir, root string) error {
 			return fmt.Errorf("%s: %w", locRel(f.Rel), err)
 		}
 		if ok {
-			byKey[path.Join(f.OriginalDir(), f.Base())] = p
+			k := path.Join(f.OriginalDir(), f.Base())
+			byKey[k] = append(byKey[k], p)
 		}
 	}
 	for _, f := range res.Files {
 		if f.IsOriginal() {
 			continue
 		}
-		p, ok := byKey[path.Join(f.OriginalDir(), f.Base())]
-		if !ok || p.asset.Kind != media.Video {
+		cands := byKey[path.Join(f.OriginalDir(), f.Base())]
+		var assets []catalog.Asset
+		for _, c := range cands {
+			if f.Role != scan.Proxy || c.asset.Kind == media.Video {
+				assets = append(assets, c.asset)
+			}
+		}
+		if len(assets) == 0 {
 			ad.act("orphan", locRel(f.Rel), "", "", "no original beside it")
 			continue
+		}
+		owner := preferredOwner(assets, f.Ext)
+		var p planned
+		for _, c := range cands {
+			if c.asset.ID == owner.ID {
+				p = c
+			}
 		}
 		if err := ad.companion(subdir, f, p); err != nil {
 			return fmt.Errorf("%s: %w", locRel(f.Rel), err)
