@@ -38,6 +38,7 @@ func TestScanDCIM(t *testing.T) {
 		"DCIM/100_PANA/P1000123.MP4",
 		"DCIM/100_PANA/P1000123.RW2",
 		"DCIM/100_PANA/P1000124.JPG",
+		"DCIM/100_PANA/P1000123.XMP",
 		"DCIM/100_PANA/._P1000123.MP4",
 		"DCIM/100_PANA/P1000123.XML",
 		"DCIM/.DS_Store",
@@ -57,6 +58,7 @@ func TestScanDCIM(t *testing.T) {
 	want := []string{
 		"DCIM/100_PANA/P1000123.MP4",
 		"DCIM/100_PANA/P1000123.RW2",
+		"DCIM/100_PANA/P1000123.XMP",
 		"DCIM/100_PANA/P1000124.JPG",
 		"DCIM/101_PANA/P1010001.RW2",
 	}
@@ -72,6 +74,9 @@ func TestScanDCIM(t *testing.T) {
 	}
 	if res.Files[1].Kind != media.Still {
 		t.Errorf("RW2 classified as %v", res.Files[1].Kind)
+	}
+	if x := res.Files[2]; x.Role != Sidecar || x.Ext != "xmp" || x.Base() != "P1000123" {
+		t.Errorf("XMP = %+v", x)
 	}
 }
 

@@ -51,7 +51,7 @@ func (e *Env) ScanSource(ctx context.Context, root string) (*Source, error) {
 		return nil, err
 	}
 	src := &Source{Loc: loc, Root: root, Shape: res.Shape, Unrecognised: res.Unrecognised}
-	byKey := map[string]catalog.Asset{} // originals by dir/base, for proxy pairing
+	byKey := map[string][]catalog.Asset{} // originals by dir/base, for companion pairing
 
 	for _, f := range res.Files {
 		if !f.IsOriginal() {
@@ -69,17 +69,22 @@ func (e *Env) ScanSource(ctx context.Context, root string) (*Source, error) {
 		if isNew {
 			src.New = append(src.New, a.ID)
 		}
-		byKey[path.Join(f.OriginalDir(), f.Base())] = a
+		k := path.Join(f.OriginalDir(), f.Base())
+		byKey[k] = append(byKey[k], a)
 	}
 	for _, f := range res.Files {
 		if f.IsOriginal() {
 			continue
 		}
-		a, ok := byKey[path.Join(f.OriginalDir(), f.Base())]
-		if !ok || a.Kind != media.Video {
+		cands := byKey[path.Join(f.OriginalDir(), f.Base())]
+		if f.Role == scan.Proxy {
+			cands = videoOnly(cands)
+		}
+		if len(cands) == 0 {
 			src.Orphans = append(src.Orphans, f.Rel)
 			continue
 		}
+		a := preferredOwner(cands, f.Ext)
 		sum, err := identity.FullFile(f.Abs)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", f.Rel, err)
@@ -209,4 +214,14 @@ func (e *Env) sourceRoots(ctx context.Context) (map[int64]string, error) {
 		out[l.ID] = l.Root
 	}
 	return out, nil
+}
+
+func videoOnly(as []catalog.Asset) []catalog.Asset {
+	var out []catalog.Asset
+	for _, a := range as {
+		if a.Kind == media.Video {
+			out = append(out, a)
+		}
+	}
+	return out
 }

@@ -584,8 +584,8 @@ func TestSidecarsTravelAndStayCurrent(t *testing.T) {
 		"Proxy/A005_12062359_C001.sidecar": 800,
 	}, 31)
 	clip := f.relOf(t, filepath.Join(card, "A005_12062359_C001.braw"), media.Video)
-	side := naming.SidecarPath(clip)
-	pside := naming.ProxySidecarPath(clip)
+	side := naming.SidecarPath(clip, "sidecar")
+	pside := naming.ProxySidecarPath(clip, "sidecar")
 
 	sum, err := f.env.Import(ctx, card)
 	if err != nil || len(sum.Failures) != 0 || len(sum.Source.Orphans) != 0 {
@@ -646,6 +646,87 @@ func TestSidecarsTravelAndStayCurrent(t *testing.T) {
 	}
 	if bad, err := linktree.Audit(filepath.Join(f.links, "video")); err != nil {
 		t.Errorf("audit: %v %v", bad, err)
+	}
+}
+
+func TestEditorCreatedSidecarsAreSwept(t *testing.T) {
+	f := newFixture(t, audioNone)
+	card := mkCard(t, f.base, "card", map[string]int{
+		"A001_C001.braw":             2 * mib,
+		"DCIM/100_PANA/P1000123.RW2": 300 * 1024,
+		"DCIM/100_PANA/P1000123.JPG": 100 * 1024,
+	}, 41)
+	// A DCIM card whose root also has a flat clip: make it flat by moving DCIM contents up.
+	os.Rename(filepath.Join(card, "DCIM/100_PANA/P1000123.RW2"), filepath.Join(card, "P1000123.RW2"))
+	os.Rename(filepath.Join(card, "DCIM/100_PANA/P1000123.JPG"), filepath.Join(card, "P1000123.JPG"))
+	os.RemoveAll(filepath.Join(card, "DCIM"))
+	clip := f.relOf(t, filepath.Join(card, "A001_C001.braw"), media.Video)
+	if _, err := f.env.Import(ctx, card); err != nil {
+		t.Fatal(err)
+	}
+
+	// Resolve creates a .sidecar beside the clip link; Lightroom writes an
+	// .xmp beside the raw's link (the JPEG shares the base name).
+	sideLink := filepath.Join(f.links, "video", naming.SidecarPath(clip, "sidecar"))
+	xmpLink := filepath.Join(f.links, "still", "2026/09/05/p1000123.xmp")
+	os.WriteFile(sideLink, []byte("braw colour settings"), 0o644)
+	os.WriteFile(xmpLink, []byte("<x:xmpmeta/>"), 0o644)
+	// A real media file in the tree is still a hard stop.
+	stray := filepath.Join(f.links, "video", "2026/09/05/dropped.braw")
+	os.WriteFile(stray, []byte("not a link"), 0o644)
+	if _, err := f.env.Relink(ctx); !errors.Is(err, linktree.ErrRealFiles) {
+		t.Fatalf("relink with a real media file: %v", err)
+	}
+	os.Remove(stray)
+
+	rep, err := f.env.Relink(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Unavailable) != 0 {
+		t.Errorf("unavailable: %v", rep.Unavailable)
+	}
+	// Both sidecars now live in the spool beside their originals and are linked.
+	spoolSide := filepath.Join(f.spool, "video", naming.SidecarPath(clip, "sidecar"))
+	spoolXMP := filepath.Join(f.spool, "stills", "2026/09/05/p1000123.xmp")
+	for link, target := range map[string]string{sideLink: spoolSide, xmpLink: spoolXMP} {
+		if !exists(target) {
+			t.Errorf("%s not swept into spool", target)
+		}
+		if got := readlink(t, link); got != target {
+			t.Errorf("%s -> %s, want %s", link, got, target)
+		}
+	}
+	if b, _ := os.ReadFile(spoolXMP); string(b) != "<x:xmpmeta/>" {
+		t.Errorf("xmp content %q", b)
+	}
+	// The xmp belongs to the raw, not the JPEG.
+	raw, err := f.env.Catalog.AssetByPath(ctx, media.Still, "2026/09/05/p1000123.rw2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	comps, _ := f.env.Catalog.Companions(ctx, raw.ID)
+	if len(comps) != 1 || comps[0].Role != catalog.RoleSidecar || comps[0].Ext != "xmp" {
+		t.Errorf("raw companions = %+v", comps)
+	}
+	jpg, _ := f.env.Catalog.AssetByPath(ctx, media.Still, "2026/09/05/p1000123.jpg")
+	if c, _ := f.env.Catalog.Companions(ctx, jpg.ID); len(c) != 0 {
+		t.Errorf("jpeg got the xmp: %+v", c)
+	}
+	// Flush carries them to the NAS and repoints the links.
+	if _, err := f.env.FlushSpool(ctx, "fast", FlushOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := readlink(t, xmpLink); got != filepath.Join(f.nas, "stills", "2026/09/05/p1000123.xmp") {
+		t.Errorf("xmp after flush -> %s", got)
+	}
+	if got := readlink(t, sideLink); got != filepath.Join(f.nas, "video", naming.SidecarPath(clip, "sidecar")) {
+		t.Errorf("sidecar after flush -> %s", got)
+	}
+	for _, root := range []string{filepath.Join(f.links, "video"), filepath.Join(f.links, "still")} {
+		if bad, err := linktree.Audit(root); err != nil {
+			t.Errorf("audit %s: %v %v", root, bad, err)
+		}
 	}
 }
 

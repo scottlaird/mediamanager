@@ -173,18 +173,22 @@ func Scan(root string, c *Classifier) (Result, error) {
 	return res, nil
 }
 
-// SidecarExt is Blackmagic's per-clip metadata file extension.
-const SidecarExt = "sidecar"
+// SidecarExts are the metadata files editors write beside media:
+// Blackmagic's .sidecar for BRAW and Adobe's .xmp for stills.
+var SidecarExts = map[string]bool{"sidecar": true, "xmp": true}
+
+// IsSidecarExt reports whether a lowercase extension names a sidecar.
+func IsSidecarExt(ext string) bool { return SidecarExts[strings.ToLower(ext)] }
 
 // roleOf classifies a file by where it sits and what it is: anything in a
-// Proxy directory is a proxy (or a proxy's sidecar), a .sidecar elsewhere
-// is the original's sidecar, and everything else is an original.
+// Proxy directory is a proxy (or a proxy's sidecar), a sidecar extension
+// elsewhere is the original's sidecar, and everything else is an original.
 func roleOf(rel string, kind media.Kind, ext string) Role {
 	inProxy := strings.EqualFold(path.Base(path.Dir(rel)), "proxy")
 	switch {
-	case ext == SidecarExt && inProxy:
+	case IsSidecarExt(ext) && inProxy:
 		return ProxySidecar
-	case ext == SidecarExt:
+	case IsSidecarExt(ext):
 		return Sidecar
 	case inProxy && kind == media.Video:
 		return Proxy

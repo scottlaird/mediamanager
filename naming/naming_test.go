@@ -96,10 +96,13 @@ func TestProxyPath(t *testing.T) {
 
 func TestSidecarPaths(t *testing.T) {
 	rel := "2026/09/05/a001-3f9a1c2e7b4d5a60.braw"
-	if got := SidecarPath(rel); got != "2026/09/05/a001-3f9a1c2e7b4d5a60.sidecar" {
+	if got := SidecarPath(rel, "sidecar"); got != "2026/09/05/a001-3f9a1c2e7b4d5a60.sidecar" {
 		t.Errorf("SidecarPath = %q", got)
 	}
-	if got := ProxySidecarPath(rel); got != "2026/09/05/Proxy/a001-3f9a1c2e7b4d5a60.sidecar" {
+	if got := SidecarPath("2026/09/05/l1004821.rw2", "XMP"); got != "2026/09/05/l1004821.xmp" {
+		t.Errorf("SidecarPath xmp = %q", got)
+	}
+	if got := ProxySidecarPath(rel, "sidecar"); got != "2026/09/05/Proxy/a001-3f9a1c2e7b4d5a60.sidecar" {
 		t.Errorf("ProxySidecarPath = %q", got)
 	}
 }

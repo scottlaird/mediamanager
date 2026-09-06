@@ -111,20 +111,17 @@ func ProxyPath(rel, ext string) string {
 	return path.Join(dir, ProxyDir, join(base, Sanitize(ext)))
 }
 
-// SidecarExt is the extension of Blackmagic's per-clip metadata file.
-const SidecarExt = "sidecar"
-
-// SidecarPath returns the path of the sidecar beside the original at rel:
-// the same name with the extension replaced.
-func SidecarPath(rel string) string {
+// SidecarPath returns the path of a sidecar beside the original at rel:
+// the same name with the extension swapped for ext (sidecar, xmp).
+func SidecarPath(rel, ext string) string {
 	dir, name := path.Split(rel)
 	base, _ := splitExt(name)
-	return path.Join(dir, join(base, SidecarExt))
+	return path.Join(dir, join(base, Sanitize(ext)))
 }
 
-// ProxySidecarPath returns the path of the sidecar beside the proxy of rel.
-func ProxySidecarPath(rel string) string {
-	return ProxyPath(rel, SidecarExt)
+// ProxySidecarPath returns the path of a sidecar beside the proxy of rel.
+func ProxySidecarPath(rel, ext string) string {
+	return ProxyPath(rel, ext)
 }
 
 // WithSuffix inserts _n before the extension, for stills whose name is
