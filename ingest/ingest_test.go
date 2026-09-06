@@ -337,7 +337,7 @@ func TestSpoolResumesPartial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Resumed != 3*mib || r.Bytes != 4*mib || r.Location != "fast" {
+	if r.Resumed != 3*mib || r.Bytes != 4*mib || r.Location != "fast" || r.Copied != mib || r.Duration <= 0 || r.MiBPerSecond <= 0 {
 		t.Errorf("result %+v", r)
 	}
 	if !sameContent(t, filepath.Join(card, "A001_C001.braw"), filepath.Join(f.spool, "video", rel)) {
