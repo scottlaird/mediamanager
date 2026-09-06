@@ -60,7 +60,7 @@ func (e *Env) Reconcile(ctx context.Context, ps []place) (ReconcileReport, error
 	for _, root := range e.linkRoots() {
 		bad, err := linktree.Audit(root)
 		if errors.Is(err, linktree.ErrRealFiles) {
-			if err = e.sweepSidecars(ctx, root, bad, rootOf); err != nil {
+			if err = e.sweepCompanions(ctx, root, bad, rootOf); err != nil {
 				return rep, err
 			}
 			bad, err = linktree.Audit(root)
@@ -225,8 +225,9 @@ func (e *Env) Archive(ctx context.Context, ps []place, assetID string) ([]CopyRe
 			continue
 		}
 		if hasComplete(copies, p.cat.ID) {
-			// The original never changes, but sidecars do: keep the NAS copy current.
-			n := e.syncCompanions(ctx, a, rootOf, p, true)
+			// The original never changes, but sidecars do and proxies appear
+			// later: keep the NAS set current.
+			n := e.syncCompanions(ctx, a, rootOf, p, false)
 			results = append(results, CopyResult{AssetID: assetID, Location: p.cat.Name, Skipped: true, Proxies: n})
 			continue
 		}
@@ -349,10 +350,11 @@ func (e *Env) copyTo(ctx context.Context, ps []place, a catalog.Asset, copies []
 }
 
 // syncCompanions brings the asset's companions to dest and returns how
-// many it wrote. Proxies are copied once and never replaced; sidecars are
-// rewritten whenever the best copy's content differs, because editors
-// change them after import. With sidecarsOnly, proxies are left alone.
-// Failures are logged, not returned: nothing here blocks the original.
+// many it wrote. Proxies are copied when missing and never replaced;
+// sidecars are rewritten whenever the best copy's content differs,
+// because editors change them after import. With sidecarsOnly, proxies
+// are left alone. Failures are logged, not returned: nothing here blocks
+// the original.
 func (e *Env) syncCompanions(ctx context.Context, a catalog.Asset, rootOf func(catalog.Location) (string, bool), dest place, sidecarsOnly bool) int {
 	comps, err := e.Catalog.Companions(ctx, a.ID)
 	if err != nil || len(comps) == 0 {
@@ -380,8 +382,12 @@ func (e *Env) syncCompanions(ctx context.Context, a catalog.Asset, rootOf func(c
 		dst := abs(dest.root, rel)
 		var sum string
 		if key.role.Regenerable() {
-			if _, err := copyfile.Copy(ctx, src, dst, copyfile.Options{}); err != nil {
+			r, err := copyfile.Copy(ctx, src, dst, copyfile.Options{})
+			if err != nil {
 				e.logf("warning: proxy %s: %v", src, err)
+				continue
+			}
+			if r.AlreadyComplete {
 				continue
 			}
 			sum, _ = identity.FullFile(dst)
@@ -585,9 +591,10 @@ func mustRoot(rootOf func(catalog.Location) (string, bool), l catalog.Location) 
 }
 
 // dropSpoolCompanions removes the asset's companions from a spool being
-// flushed. Proxies just go. A sidecar is first brought up to date on the
-// NAS (it may have been edited since it was archived) and is kept if that
-// fails, so a sidecar is never the last copy that gets deleted.
+// flushed, after making sure the NAS has them: a sidecar is brought up to
+// date (it may have been edited since it was archived), a proxy is copied
+// if missing (regenerable, but not free). Anything that cannot be secured
+// on the NAS stays on the spool.
 func (e *Env) dropSpoolCompanions(ctx context.Context, a catalog.Asset, spool place, rootOf func(catalog.Location) (string, bool)) {
 	comps, err := e.Catalog.Companions(ctx, a.ID)
 	if err != nil {
@@ -604,11 +611,9 @@ func (e *Env) dropSpoolCompanions(ctx context.Context, a catalog.Asset, spool pl
 			continue
 		}
 		src := abs(spool.root, c.RelPath)
-		if !c.Role.Regenerable() {
-			if !e.sidecarSafeOnNAS(ctx, a, c, src, t.Subdir, locByID, rootOf) {
-				e.logf("keeping sidecar %s: no verified NAS copy", c.RelPath)
-				continue
-			}
+		if !e.companionSafeOnNAS(ctx, a, c, src, t.Subdir, locByID, rootOf) {
+			e.logf("keeping %s %s: no NAS copy", c.Role, c.RelPath)
+			continue
 		}
 		if err := os.Remove(src); err != nil && !errors.Is(err, os.ErrNotExist) {
 			e.logf("warning: removing %s: %v", c.RelPath, err)
@@ -618,9 +623,10 @@ func (e *Env) dropSpoolCompanions(ctx context.Context, a catalog.Asset, spool pl
 	}
 }
 
-// sidecarSafeOnNAS makes sure some mounted NAS holds a byte-identical copy
-// of the sidecar at src, writing it if needed, and reports success.
-func (e *Env) sidecarSafeOnNAS(ctx context.Context, a catalog.Asset, c catalog.Companion, src, subdir string, locByID map[int64]catalog.Location, rootOf func(catalog.Location) (string, bool)) bool {
+// companionSafeOnNAS makes sure some mounted NAS holds the companion at
+// src, writing it if needed (sidecars are updated to match, proxies only
+// copied when absent), and reports success.
+func (e *Env) companionSafeOnNAS(ctx context.Context, a catalog.Asset, c catalog.Companion, src, subdir string, locByID map[int64]catalog.Location, rootOf func(catalog.Location) (string, bool)) bool {
 	for _, l := range locByID {
 		if l.Kind != catalog.NAS {
 			continue
@@ -631,7 +637,12 @@ func (e *Env) sidecarSafeOnNAS(ctx context.Context, a catalog.Asset, c catalog.C
 		}
 		rel := path.Join(subdir, companionPath(a.RelPath, c.Role, c.Ext))
 		dst := abs(root, rel)
-		if _, err := replaceIfDifferent(src, dst); err != nil {
+		if c.Role.Regenerable() {
+			if _, err := copyfile.Copy(ctx, src, dst, copyfile.Options{}); err != nil && !errors.Is(err, copyfile.ErrExists) {
+				e.logf("warning: copying proxy to %s: %v", l.Name, err)
+				continue
+			}
+		} else if _, err := replaceIfDifferent(src, dst); err != nil {
 			e.logf("warning: syncing sidecar to %s: %v", l.Name, err)
 			continue
 		}
@@ -644,19 +655,22 @@ func (e *Env) sidecarSafeOnNAS(ctx context.Context, a catalog.Asset, c catalog.C
 	return false
 }
 
-// sweepSidecars handles the one kind of real file that legitimately turns
-// up in a link tree: a sidecar an editor just created beside the link it
-// opened (Resolve's .sidecar, Lightroom's .xmp). Each is moved into storage
-// beside the copy the link points at, recorded as a companion, and then
-// linked like any other by the reconcile that follows. Any other real file
-// is left for the audit to reject.
-func (e *Env) sweepSidecars(ctx context.Context, root string, offenders []string, rootOf func(catalog.Location) (string, bool)) error {
+// sweepCompanions handles the kinds of real file that legitimately turn up
+// in a link tree: a sidecar an editor created beside the link it opened
+// (Resolve's .sidecar, Lightroom's .xmp), or a proxy a generator wrote into
+// a Proxy folder beside it (Blackmagic Proxy Generator watching the tree).
+// Each is moved into storage beside the copy the link points at, recorded
+// as a companion, and then linked like any other by the reconcile that
+// follows. Any other real file is left for the audit to reject.
+func (e *Env) sweepCompanions(ctx context.Context, root string, offenders []string, rootOf func(catalog.Location) (string, bool)) error {
 	for _, rel := range offenders {
 		ext := strings.ToLower(strings.TrimPrefix(path.Ext(rel), "."))
-		if !scan.IsSidecarExt(ext) {
+		kind, _ := e.classifier.Classify(path.Base(rel))
+		inProxy := strings.EqualFold(path.Base(path.Dir(rel)), "proxy")
+		if !scan.IsSidecarExt(ext) && !(inProxy && kind == media.Video) {
 			continue
 		}
-		a, role, ok, err := e.sidecarOwner(ctx, root, rel)
+		a, role, ok, err := e.companionOwner(ctx, root, rel)
 		if err != nil {
 			return err
 		}
@@ -677,38 +691,67 @@ func (e *Env) sweepSidecars(ctx context.Context, root string, offenders []string
 			}
 		}
 		if dest == nil {
-			e.logf("warning: %s: no spool or NAS copy of %s is mounted; sidecar left in place", rel, a.RelPath)
+			e.logf("warning: %s: no spool or NAS copy of %s is mounted; left in place", rel, a.RelPath)
 			continue
 		}
 		t, _ := e.Config.Tree(a.Kind)
 		destRoot, _ := rootOf(dest.Location)
 		destRel := path.Join(t.Subdir, companionPath(a.RelPath, role, ext))
-		src := abs(root, rel)
-		if _, err := replaceIfDifferent(src, abs(destRoot, destRel)); err != nil {
-			return fmt.Errorf("sweeping %s: %w", rel, err)
+		src, dst := abs(root, rel), abs(destRoot, destRel)
+		if role.Regenerable() {
+			if err := moveFile(ctx, src, dst); err != nil {
+				return fmt.Errorf("sweeping %s: %w", rel, err)
+			}
+		} else {
+			if _, err := replaceIfDifferent(src, dst); err != nil {
+				return fmt.Errorf("sweeping %s: %w", rel, err)
+			}
+			if err := os.Remove(src); err != nil {
+				return err
+			}
 		}
-		if err := os.Remove(src); err != nil {
-			return err
-		}
-		sum, _ := identity.FullFile(abs(destRoot, destRel))
+		sum, _ := identity.FullFile(dst)
 		if err := e.Catalog.PutCompanion(ctx, catalog.Companion{AssetID: a.ID, LocationID: dest.LocationID, Role: role, Ext: ext, RelPath: destRel, SHA256: sum}); err != nil {
 			return err
 		}
-		e.logf("swept %s into %s", rel, dest.Location.Name)
+		e.logf("swept %s %s into %s", role, rel, dest.Location.Name)
 	}
 	return nil
 }
 
-// sidecarOwner finds the asset a stray sidecar belongs to: the link beside
-// it (same directory, same base) resolves to an asset path, or for a file
-// under Proxy/, the proxy link beside it does.
-func (e *Env) sidecarOwner(ctx context.Context, root, rel string) (catalog.Asset, catalog.Role, bool, error) {
+// moveFile relocates a possibly large file: a rename when src and dst
+// share a filesystem, otherwise a verified copy followed by removing the
+// source. An existing dst is replaced; callers use it for regenerable
+// files only.
+func moveFile(ctx context.Context, src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	_ = os.Remove(dst)
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+	if _, err := copyfile.Copy(ctx, src, dst, copyfile.Options{}); err != nil {
+		return err
+	}
+	return os.Remove(src)
+}
+
+// companionOwner finds the asset a stray companion belongs to: the link
+// beside it (same directory, same base) resolves to an asset path, or for
+// a file under Proxy/, the link in the parent directory does. The role
+// follows from where it sits and what it is.
+func (e *Env) companionOwner(ctx context.Context, root, rel string) (catalog.Asset, catalog.Role, bool, error) {
 	dir, name := path.Split(rel)
 	base := strings.TrimSuffix(name, path.Ext(name))
+	ext := strings.ToLower(strings.TrimPrefix(path.Ext(name), "."))
 	role := catalog.RoleSidecar
 	assetDir := dir
 	if strings.EqualFold(path.Base(path.Clean(dir)), "proxy") {
 		role = catalog.RoleProxySidecar
+		if !scan.IsSidecarExt(ext) {
+			role = catalog.RoleProxy
+		}
 		assetDir = path.Dir(path.Clean(dir)) + "/"
 		if assetDir == "./" {
 			assetDir = ""
@@ -733,10 +776,13 @@ func (e *Env) sidecarOwner(ctx context.Context, root, rel string) (catalog.Asset
 			}
 		}
 	}
+	if role == catalog.RoleProxy {
+		candidates = videoOnly(candidates)
+	}
 	if len(candidates) == 0 {
 		return catalog.Asset{}, "", false, nil
 	}
-	return preferredOwner(candidates, strings.ToLower(strings.TrimPrefix(path.Ext(name), "."))), role, true, nil
+	return preferredOwner(candidates, ext), role, true, nil
 }
 
 // preferredOwner picks which of several same-base originals a sidecar

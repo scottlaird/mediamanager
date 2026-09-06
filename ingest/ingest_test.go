@@ -898,6 +898,125 @@ func TestArchivePlan(t *testing.T) {
 	}
 }
 
+func TestSpoolBackAndSelect(t *testing.T) {
+	f := newFixture(t, audioNone)
+	card := mkCard(t, f.base, "card", map[string]int{"A001_C001.braw": 2 * mib, "B001_C001.braw": mib, "L1.DNG": 4096}, 71)
+	if _, err := f.env.Import(ctx, card); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.env.FlushSpool(ctx, "fast", FlushOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	clip := f.relOf(t, filepath.Join(card, "A001_C001.braw"), media.Video)
+	if got := readlink(t, filepath.Join(f.links, "video", clip)); got != filepath.Join(f.nas, "video", clip) {
+		t.Fatalf("after flush link -> %s", got)
+	}
+
+	// Select by id, by relpath prefix, by kind/relpath prefix; reject junk.
+	a, _ := f.env.Catalog.AssetByPath(ctx, media.Video, clip)
+	for _, tt := range []struct {
+		args []string
+		want int
+	}{
+		{[]string{a.ID}, 1},
+		{[]string{"2026/09/05/a001"}, 1},
+		{[]string{"video/2026"}, 2},
+		{[]string{"2026"}, 3},
+		{[]string{a.ID, "2026/09/05/a001"}, 1}, // deduplicated
+	} {
+		refs, err := f.env.Select(ctx, tt.args)
+		if err != nil || len(refs) != tt.want {
+			t.Errorf("Select(%v) = %d refs, %v; want %d", tt.args, len(refs), err, tt.want)
+		}
+	}
+	if _, err := f.env.Select(ctx, []string{"nope"}); err == nil {
+		t.Error("unknown selector accepted")
+	}
+
+	refs, _ := f.env.Select(ctx, []string{"video/2026"})
+	sum, err := f.env.SpoolAll(ctx, refs, true)
+	if err != nil || sum.Spooled != 2 || sum.Skipped != 0 || len(sum.Failures) != 0 || sum.Copied != 3*mib {
+		t.Fatalf("spool back: %+v, %v", sum, err)
+	}
+	if got := readlink(t, filepath.Join(f.links, "video", clip)); got != filepath.Join(f.spool, "video", clip) {
+		t.Errorf("after spool link -> %s", got)
+	}
+	if !sameContent(t, filepath.Join(f.nas, "video", clip), filepath.Join(f.spool, "video", clip)) {
+		t.Error("spooled copy differs from NAS")
+	}
+	a, _ = f.env.Catalog.Asset(ctx, a.ID)
+	if !a.Pinned {
+		t.Error("not pinned")
+	}
+	rep, _ := f.env.FlushSpool(ctx, "fast", FlushOptions{})
+	if len(rep.Flushed) != 0 {
+		t.Errorf("flush removed pinned assets: %+v", rep)
+	}
+	sum, _ = f.env.SpoolAll(ctx, refs, false)
+	if sum.Skipped != 2 || sum.Spooled != 0 {
+		t.Errorf("second spool: %+v", sum)
+	}
+}
+
+func TestGeneratedProxyInLinkTreeIsSwept(t *testing.T) {
+	f := newFixture(t, audioNone)
+	card := mkCard(t, f.base, "card", map[string]int{"A001_C001.braw": 2 * mib}, 73)
+	if _, err := f.env.Import(ctx, card); err != nil {
+		t.Fatal(err)
+	}
+	clip := f.relOf(t, filepath.Join(card, "A001_C001.braw"), media.Video)
+	proxyRel := naming.ProxyPath(clip, "mov")
+	// Blackmagic Proxy Generator, watching ~/Video, writes Proxy/<base>.mov beside the link.
+	dropped := filepath.Join(f.links, "video", proxyRel)
+	os.MkdirAll(filepath.Dir(dropped), 0o755)
+	os.WriteFile(dropped, bytes.Repeat([]byte("proxy"), 200000), 0o644)
+
+	if _, err := f.env.Relink(ctx); err != nil {
+		t.Fatalf("relink with a generated proxy: %v", err)
+	}
+	spoolProxy := filepath.Join(f.spool, "video", proxyRel)
+	if !exists(spoolProxy) {
+		t.Fatal("proxy not swept into the spool")
+	}
+	if got := readlink(t, dropped); got != spoolProxy {
+		t.Errorf("proxy link -> %s", got)
+	}
+	a, _ := f.env.Catalog.AssetByPath(ctx, media.Video, clip)
+	comps, _ := f.env.Catalog.Companions(ctx, a.ID)
+	if len(comps) != 1 || comps[0].Role != catalog.RoleProxy || comps[0].Ext != "mov" {
+		t.Errorf("companions = %+v", comps)
+	}
+	// It reaches the NAS on the next archive pass, and survives a flush.
+	if _, err := f.env.ArchiveAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.env.Import(ctx, card); err != nil { // already-archived path syncs companions
+		t.Fatal(err)
+	}
+	nasProxy := filepath.Join(f.nas, "video", proxyRel)
+	if !exists(nasProxy) {
+		t.Fatal("proxy not copied to the NAS")
+	}
+	if _, err := f.env.FlushSpool(ctx, "fast", FlushOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if exists(spoolProxy) || !exists(nasProxy) {
+		t.Error("flush did not move the proxy's link to the NAS copy")
+	}
+	if got := readlink(t, dropped); got != nasProxy {
+		t.Errorf("after flush proxy link -> %s", got)
+	}
+	// A proxy generated while the clip is already flushed goes to the NAS directly.
+	os.Remove(dropped)
+	os.WriteFile(dropped, bytes.Repeat([]byte("proxy2"), 100000), 0o644)
+	if _, err := f.env.Relink(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(nasProxy); len(b) != 600000 {
+		t.Errorf("regenerated proxy not placed on the NAS: %d bytes", len(b))
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

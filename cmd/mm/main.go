@@ -53,7 +53,7 @@ func root() *cobra.Command {
 	}
 	cmd.PersistentFlags().StringVar(&configPath, "config", "", "config file (default "+config.DefaultPath()+")")
 	cmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "log every copy and progress")
-	cmd.AddCommand(importCmd(), adoptCmd(), archiveCmd(), flushCmd(), relinkCmd(), statusCmd(), lsCmd(), pinCmd(true), pinCmd(false), volumeCmd(), workerCmd())
+	cmd.AddCommand(importCmd(), adoptCmd(), archiveCmd(), flushCmd(), spoolCmd(), relinkCmd(), statusCmd(), lsCmd(), pinCmd(true), pinCmd(false), volumeCmd(), workerCmd())
 	return cmd
 }
 

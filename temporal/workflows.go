@@ -322,3 +322,65 @@ func alreadyRunning(err error) bool {
 	var already *temporal.ChildWorkflowExecutionAlreadyStartedError
 	return errors.As(err, &already)
 }
+
+// SpoolResult is what SpoolAssets returns.
+type SpoolResult struct {
+	Assets       int
+	Spooled      int
+	Skipped      int
+	Failures     []string
+	Copied       int64
+	Duration     time.Duration
+	MiBPerSecond float64
+}
+
+// SpoolAssets brings assets back onto local storage from the NAS, all at
+// once on the NAS queue (whose worker bounds how many run together), and
+// optionally pins them first so a flush cannot undo the work: `mm spool`.
+func SpoolAssets(ctx workflow.Context, refs []ingest.AssetRef, pin bool, q Queues) (*SpoolResult, error) {
+	var acts *Activities
+	res := &SpoolResult{Assets: len(refs)}
+	if pin {
+		ids := make([]string, 0, len(refs))
+		for _, r := range refs {
+			ids = append(ids, r.ID)
+		}
+		if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, quickOpts), acts.Pin, ids, true).Get(ctx, nil); err != nil {
+			return nil, err
+		}
+	}
+	opts := copyOpts
+	opts.TaskQueue = q.NAS
+	var total int64
+	futures := make([]workflow.Future, 0, len(refs))
+	for _, ref := range refs {
+		o := opts
+		o.Summary = ref.Path
+		futures = append(futures, workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, o), acts.Spool, ref))
+		total += ref.Size
+	}
+	workflow.SetCurrentDetails(ctx, fmt.Sprintf("spooling %d assets, %s", len(refs), fmtBytes(total)))
+	for i, f := range futures {
+		var r ingest.CopyResult
+		if err := f.Get(ctx, &r); err != nil {
+			res.Failures = append(res.Failures, refs[i].Path+": "+err.Error())
+			continue
+		}
+		if r.Skipped {
+			res.Skipped++
+			continue
+		}
+		res.Spooled++
+		res.Copied += r.Copied
+		res.Duration += r.Duration
+	}
+	if res.Duration > 0 {
+		res.MiBPerSecond = float64(res.Copied) / (1 << 20) / res.Duration.Seconds()
+	}
+	workflow.SetCurrentDetails(ctx, fmt.Sprintf("%d spooled, %d already local, %d failed; %s at %.0f MiB/s per copy",
+		res.Spooled, res.Skipped, len(res.Failures), fmtBytes(res.Copied), res.MiBPerSecond))
+	return res, nil
+}
+
+// SpoolWorkflowID names a spool-back run.
+func SpoolWorkflowID(tag string) string { return "spool:" + tag }

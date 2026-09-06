@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/scottlaird/mediamanager/config"
 	"github.com/scottlaird/mediamanager/ingest"
@@ -41,6 +42,7 @@ func RunWorker(ctx context.Context, c client.Client, env *ingest.Env, q Queues, 
 	main.RegisterWorkflow(ArchiveAsset)
 	main.RegisterWorkflow(ArchiveBacklog)
 	main.RegisterWorkflow(FlushSpool)
+	main.RegisterWorkflow(SpoolAssets)
 	main.RegisterActivity(acts)
 
 	if nasSlots <= 0 {
@@ -90,6 +92,20 @@ func StartFlush(ctx context.Context, c client.Client, q Queues, spool string, op
 		WorkflowIDConflictPolicy: enums.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
 		StaticSummary:            "flush " + spool,
 	}, FlushSpool, spool, opts)
+}
+
+// StartSpool starts a spool-back workflow. Each start is its own run; the
+// ID carries the first path and a timestamp so the UI reads sensibly.
+func StartSpool(ctx context.Context, c client.Client, q Queues, refs []ingest.AssetRef, pin bool) (client.WorkflowRun, error) {
+	tag := time.Now().UTC().Format("20060102T150405Z")
+	if len(refs) > 0 {
+		tag = refs[0].Path + "+" + fmt.Sprint(len(refs)-1) + ":" + tag
+	}
+	return c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+		ID:            SpoolWorkflowID(tag),
+		TaskQueue:     q.Main,
+		StaticSummary: fmt.Sprintf("spool %d assets to local storage", len(refs)),
+	}, SpoolAssets, refs, pin, q)
 }
 
 // idSafe makes a path usable inside a workflow ID.

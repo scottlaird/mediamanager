@@ -474,3 +474,73 @@ func writeAdoptLog(catalogPath string, rep *ingest.AdoptReport) (string, error) 
 	}
 	return p, nil
 }
+
+func spoolCmd() *cobra.Command {
+	var pin, detach bool
+	cmd := &cobra.Command{
+		Use:   "spool <path-prefix|asset-id>...",
+		Short: "Bring assets back from the NAS onto local storage",
+		Long: `Spool is the opposite of flush: it copies the selected assets onto the
+first spool with room and repoints their links there. Select by asset id,
+by path prefix (2026/07/10) or by kind/path prefix (video/2026). With
+--pin the assets are also pinned so the next flush leaves them alone.`,
+		Args: cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			env, done, err := openEnv()
+			if err != nil {
+				return err
+			}
+			defer done()
+			refs, err := env.Select(cmd.Context(), args)
+			if err != nil {
+				return err
+			}
+			var total int64
+			for _, r := range refs {
+				total += r.Size
+			}
+			fmt.Printf("%d assets, %s\n", len(refs), humanSize(total))
+			if c, q, ok, err := temporalClient(env); err != nil {
+				return err
+			} else if ok {
+				defer c.Close()
+				run, err := mmtemporal.StartSpool(cmd.Context(), c, q, refs, pin)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("workflow %s run %s\n", run.GetID(), run.GetRunID())
+				if detach {
+					return nil
+				}
+				var res mmtemporal.SpoolResult
+				if err := run.Get(cmd.Context(), &res); err != nil {
+					return err
+				}
+				fmt.Printf("%d spooled, %d already local, %s at %.0f MiB/s per copy\n", res.Spooled, res.Skipped, humanSize(res.Copied), res.MiBPerSecond)
+				for _, f := range res.Failures {
+					fmt.Printf("  FAILED %s\n", f)
+				}
+				if len(res.Failures) > 0 {
+					return errors.New("spool finished with errors")
+				}
+				return nil
+			}
+			sum, err := env.SpoolAll(cmd.Context(), refs, pin)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("%d spooled, %d already local, %s\n", sum.Spooled, sum.Skipped, humanSize(sum.Copied))
+			for _, f := range sum.Failures {
+				fmt.Printf("  FAILED %s %s: %v\n", f.Step, f.AssetID, f.Err)
+			}
+			if len(sum.Failures) > 0 {
+				return errors.New("spool finished with errors")
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&pin, "pin", false, "also pin the assets so flush keeps them")
+	cmd.Flags().BoolVar(&detach, "detach", false, "with Temporal: start the workflow and return without waiting")
+	cmd.Flags().BoolVar(&local, "local", false, "run in-process even if temporal is configured")
+	return cmd
+}
