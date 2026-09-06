@@ -271,6 +271,46 @@ func (e *Env) ArchivePlan(ctx context.Context) ([]ArchiveItem, error) {
 	return items, nil
 }
 
+// SpoolAsset is Spool with location resolution done for the caller.
+func (e *Env) SpoolAsset(ctx context.Context, id string) (CopyResult, error) {
+	ps, err := e.places(ctx)
+	if err != nil {
+		return CopyResult{}, err
+	}
+	return e.Spool(ctx, ps, id)
+}
+
+// ArchiveAsset is Archive with location resolution done for the caller.
+func (e *Env) ArchiveAsset(ctx context.Context, id string) ([]CopyResult, error) {
+	ps, err := e.places(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return e.Archive(ctx, ps, id)
+}
+
+// IsArchived reports whether the asset has a complete copy on a mounted NAS.
+func (e *Env) IsArchived(ctx context.Context, id string) (bool, error) {
+	ps, err := e.places(ctx)
+	if err != nil {
+		return false, err
+	}
+	return e.archived(ctx, ps, id)
+}
+
+// NeedsArchiveIDs lists assets lacking a NAS copy, oldest capture first.
+func (e *Env) NeedsArchiveIDs(ctx context.Context) ([]string, error) {
+	assets, err := e.Catalog.NeedsArchive(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(assets))
+	for _, a := range assets {
+		ids = append(ids, a.ID)
+	}
+	return ids, nil
+}
+
 // FlushSpool is Flush with location resolution done for the caller.
 func (e *Env) FlushSpool(ctx context.Context, spoolName string, opts FlushOptions) (FlushReport, error) {
 	ps, err := e.places(ctx)

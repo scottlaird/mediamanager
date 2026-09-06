@@ -200,3 +200,17 @@ func abs(root, rel string) string { return filepath.Join(root, filepath.FromSlas
 
 // freeSpace is a variable so tests can simulate a full spool.
 var freeSpace = statfsFree
+
+type progressKey struct{}
+
+// WithProgress attaches a callback that copy steps invoke with bytes done
+// and total as they run, in addition to logging. Temporal activities use
+// it to heartbeat.
+func WithProgress(ctx context.Context, fn func(done, total int64)) context.Context {
+	return context.WithValue(ctx, progressKey{}, fn)
+}
+
+func progressFrom(ctx context.Context) func(done, total int64) {
+	fn, _ := ctx.Value(progressKey{}).(func(done, total int64))
+	return fn
+}
