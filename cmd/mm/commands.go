@@ -136,7 +136,7 @@ func archiveCmd() *cobra.Command {
 				if err := run.Get(cmd.Context(), &res); err != nil {
 					return err
 				}
-				fmt.Printf("%d archived of %d\n", res.Archived, res.Assets)
+				fmt.Printf("%d archived of %d, %s at %.0f MiB/s per copy\n", res.Archived, res.Assets, humanSize(res.Copied), res.MiBPerSecond)
 				for _, f := range res.Failures {
 					fmt.Printf("  FAILED %s\n", f)
 				}

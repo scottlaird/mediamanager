@@ -136,14 +136,14 @@ func ImportSource(ctx workflow.Context, root string, q Queues) (*ImportResult, e
 	}
 	workflow.SetCurrentDetails(ctx, fmt.Sprintf("waiting for %d archive workflows", len(children)))
 	for id, f := range children {
-		var n int
-		if err := f.Get(ctx, &n); err != nil {
+		var ar ArchiveResult
+		if err := f.Get(ctx, &ar); err != nil {
 			if !alreadyRunning(err) {
 				res.Failures = append(res.Failures, id+": archive: "+err.Error())
 			}
 			continue
 		}
-		res.Archived += n
+		res.Archived += ar.Copies
 	}
 
 	res.SafeToFormat = len(src.Assets) > 0
@@ -174,11 +174,27 @@ func startArchive(ctx workflow.Context, ref ingest.AssetRef, q Queues) workflow.
 	return workflow.ExecuteChildWorkflow(cctx, ArchiveAsset, ref, q)
 }
 
-// ArchiveAsset copies one asset to every NAS lacking it, on the NAS queue,
-// and returns how many copies it made. It is its own workflow so that it
-// survives the import that started it and so two imports of the same
-// content share one copy.
-func ArchiveAsset(ctx workflow.Context, ref ingest.AssetRef, q Queues) (int, error) {
+// ArchiveResult is what ArchiveAsset returns: how many copies it made and
+// how the copying went, so the workflow result reads as a report.
+type ArchiveResult struct {
+	Path string
+	// Copies is the number of NAS locations that received the asset.
+	Copies    int
+	Locations []string
+	// Skipped lists NAS locations that already had it.
+	Skipped []string
+	// Bytes is the size of the asset; Copied is what actually moved,
+	// summed over locations; Duration and MiBPerSecond cover the copies.
+	Bytes        int64
+	Copied       int64
+	Duration     time.Duration
+	MiBPerSecond float64
+}
+
+// ArchiveAsset copies one asset to every NAS lacking it, on the NAS queue.
+// It is its own workflow so that it survives the import that started it
+// and so two imports of the same content share one copy.
+func ArchiveAsset(ctx workflow.Context, ref ingest.AssetRef, q Queues) (*ArchiveResult, error) {
 	var acts *Activities
 	opts := copyOpts
 	opts.TaskQueue = q.NAS
@@ -187,23 +203,30 @@ func ArchiveAsset(ctx workflow.Context, ref ingest.AssetRef, q Queues) (int, err
 	var results []ingest.CopyResult
 	if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, opts), acts.Archive, ref).Get(ctx, &results); err != nil {
 		workflow.SetCurrentDetails(ctx, "failed: "+err.Error())
-		return 0, err
+		return nil, err
 	}
-	n := 0
-	var where []string
+	res := &ArchiveResult{Path: ref.Path, Bytes: ref.Size}
 	for _, r := range results {
-		if !r.Skipped {
-			n++
-			where = append(where, r.Location)
+		if r.Skipped {
+			res.Skipped = append(res.Skipped, r.Location)
+			continue
 		}
+		res.Copies++
+		res.Locations = append(res.Locations, r.Location)
+		res.Copied += r.Copied
+		res.Duration += r.Duration
 	}
-	switch n {
+	if res.Duration > 0 {
+		res.MiBPerSecond = float64(res.Copied) / (1 << 20) / res.Duration.Seconds()
+	}
+	switch res.Copies {
 	case 0:
 		workflow.SetCurrentDetails(ctx, "already on the NAS; sidecars refreshed")
 	default:
-		workflow.SetCurrentDetails(ctx, fmt.Sprintf("copied to %s", strings.Join(where, ", ")))
+		workflow.SetCurrentDetails(ctx, fmt.Sprintf("copied to %s: %s in %s (%.0f MiB/s)",
+			strings.Join(res.Locations, ", "), fmtBytes(res.Copied), res.Duration.Round(time.Second), res.MiBPerSecond))
 	}
-	return n, nil
+	return res, nil
 }
 
 // withSummary labels an activity with the file it works on.
@@ -226,11 +249,16 @@ func fmtBytes(n int64) string {
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
-// BacklogResult is what ArchiveBacklog returns.
+// BacklogResult is what ArchiveBacklog returns. Duration is summed over
+// copies, so with several running at once it exceeds wall time and the
+// rate is per copy, not aggregate.
 type BacklogResult struct {
-	Assets   int
-	Archived int
-	Failures []string
+	Assets       int
+	Archived     int
+	Failures     []string
+	Copied       int64
+	Duration     time.Duration
+	MiBPerSecond float64
 }
 
 // ArchiveBacklog hands every asset lacking a NAS copy to ArchiveAsset and
@@ -251,16 +279,22 @@ func ArchiveBacklog(ctx workflow.Context, q Queues) (*BacklogResult, error) {
 	}
 	workflow.SetCurrentDetails(ctx, fmt.Sprintf("waiting for %d archive workflows, %s", len(futures), fmtBytes(total)))
 	for id, f := range futures {
-		var n int
-		if err := f.Get(ctx, &n); err != nil {
+		var ar ArchiveResult
+		if err := f.Get(ctx, &ar); err != nil {
 			if !alreadyRunning(err) {
 				res.Failures = append(res.Failures, id+": "+err.Error())
 			}
 			continue
 		}
-		res.Archived += n
+		res.Archived += ar.Copies
+		res.Copied += ar.Copied
+		res.Duration += ar.Duration
 	}
-	workflow.SetCurrentDetails(ctx, fmt.Sprintf("%d of %d archived, %d failed", res.Archived, res.Assets, len(res.Failures)))
+	if res.Duration > 0 {
+		res.MiBPerSecond = float64(res.Copied) / (1 << 20) / res.Duration.Seconds()
+	}
+	workflow.SetCurrentDetails(ctx, fmt.Sprintf("%d of %d archived, %d failed; %s at %.0f MiB/s per copy",
+		res.Archived, res.Assets, len(res.Failures), fmtBytes(res.Copied), res.MiBPerSecond))
 	return res, nil
 }
 

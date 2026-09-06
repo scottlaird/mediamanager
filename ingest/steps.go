@@ -164,6 +164,12 @@ type CopyResult struct {
 	Bytes   int64
 	Resumed int64
 	Proxies int
+	// Duration is wall time for the copy itself, verification included;
+	// Copied is the bytes actually moved (Bytes minus Resumed) and
+	// MiBPerSecond is Copied over Duration.
+	Duration     time.Duration
+	Copied       int64
+	MiBPerSecond float64
 }
 
 // Spool copies an asset onto the first mounted spool with room for it,
@@ -290,6 +296,7 @@ func (e *Env) copyTo(ctx context.Context, ps []place, a catalog.Asset, copies []
 	e.logf("%s: copy %s -> %s (%s)", label, src, dst, fmtBytes(a.Size))
 	var prog *progress
 	external := progressFrom(ctx)
+	started := time.Now()
 	res, err := copyfile.Copy(ctx, src, dst, copyfile.Options{
 		ExpectID: expect,
 		Progress: func(done, total int64) {
@@ -308,10 +315,16 @@ func (e *Env) copyTo(ctx context.Context, ps []place, a catalog.Asset, copies []
 	if err != nil {
 		return CopyResult{}, fmt.Errorf("%s -> %s: %w", a.RelPath, dest.cat.Name, err)
 	}
+	elapsed := time.Since(started)
+	copied := res.Size - res.Resumed
+	rate := 0.0
+	if elapsed > 0 {
+		rate = float64(copied) / (1 << 20) / elapsed.Seconds()
+	}
 	if res.Resumed > 0 {
 		e.logf("%s: resumed, %s was already at %s", label, fmtBytes(res.Resumed), dest.cat.Name)
 	}
-	e.logf("%s: done -> %s", label, dest.cat.Name)
+	e.logf("%s: done -> %s, %s in %s (%.0f MiB/s)", label, dest.cat.Name, fmtBytes(copied), elapsed.Round(time.Second), rate)
 	full := res.FullSHA256
 	if full == "" {
 		full = a.FullSHA256
@@ -329,7 +342,10 @@ func (e *Env) copyTo(ctx context.Context, ps []place, a catalog.Asset, copies []
 	if _, err := e.Reconcile(ctx, ps); err != nil {
 		return CopyResult{}, err
 	}
-	return CopyResult{AssetID: a.ID, Location: dest.cat.Name, Bytes: res.Size, Resumed: res.Resumed, Proxies: n}, nil
+	return CopyResult{
+		AssetID: a.ID, Location: dest.cat.Name, Bytes: res.Size, Resumed: res.Resumed, Proxies: n,
+		Duration: elapsed, Copied: copied, MiBPerSecond: rate,
+	}, nil
 }
 
 // syncCompanions brings the asset's companions to dest and returns how

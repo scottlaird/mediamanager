@@ -235,6 +235,32 @@ func TestSpoolActivityHeartbeats(t *testing.T) {
 	}
 }
 
+func TestArchiveAssetResult(t *testing.T) {
+	f := newFixture(t, true)
+	card := f.card(t, map[string]int{"A001_C001.braw": 2 * mib})
+	src, err := f.env.ScanSource(context.Background(), card)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := newEnv(t, f)
+	env.ExecuteWorkflow(ArchiveAsset, src.Refs[0], QueuesFor("t"))
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatal(err)
+	}
+	var ar ArchiveResult
+	env.GetWorkflowResult(&ar)
+	if ar.Copies != 1 || ar.Path != src.Refs[0].Path || ar.Bytes != 2*mib || ar.Copied != 2*mib || ar.Duration <= 0 || ar.MiBPerSecond <= 0 || len(ar.Locations) != 1 {
+		t.Errorf("result %+v", ar)
+	}
+	// Second time: nothing copied, rate stays zero rather than dividing by nothing.
+	env = newEnv(t, f)
+	env.ExecuteWorkflow(ArchiveAsset, src.Refs[0], QueuesFor("t"))
+	env.GetWorkflowResult(&ar)
+	if ar.Copies != 0 || len(ar.Skipped) != 1 || ar.Copied != 0 || ar.MiBPerSecond != 0 {
+		t.Errorf("second result %+v", ar)
+	}
+}
+
 func TestArchiveWorkflowID(t *testing.T) {
 	ref := ingest.AssetRef{ID: "6b09f8b22a45eb03", Path: "video/2026/07/10/a021_07100435_c001-6b09f8b22a45eb03.braw"}
 	if got := ArchiveWorkflowID(ref); got != "archive:video/2026/07/10/a021_07100435_c001-6b09f8b22a45eb03.braw" {
