@@ -284,14 +284,27 @@ func (e *Env) copyTo(ctx context.Context, ps []place, a catalog.Asset, copies []
 	if a.Kind.UsesSparseID() {
 		expect = identity.ID(a.ID)
 	}
-	e.logf("copy %s -> %s", src, dst)
+	e.logf("copy %s -> %s (%s)", src, dst, fmtBytes(a.Size))
+	var prog *progress
 	res, err := copyfile.Copy(ctx, src, dst, copyfile.Options{
 		ExpectID: expect,
-		Progress: func(done, total int64) { e.logf("  %s: %d%%", a.RelPath, done*100/max(total, 1)) },
+		Progress: func(done, total int64) {
+			if prog == nil {
+				// The first report arrives after one buffer past any resumed
+				// prefix; rates are measured from there.
+				prog = newProgress(e.Logf, a.RelPath, done)
+				return
+			}
+			prog.report(done, total)
+		},
 	})
 	if err != nil {
 		return CopyResult{}, fmt.Errorf("%s -> %s: %w", a.RelPath, dest.cat.Name, err)
 	}
+	if res.Resumed > 0 {
+		e.logf("  %s: resumed %s already at %s", a.RelPath, fmtBytes(res.Resumed), dest.cat.Name)
+	}
+	e.logf("done %s -> %s", a.RelPath, dest.cat.Name)
 	full := res.FullSHA256
 	if full == "" {
 		full = a.FullSHA256
