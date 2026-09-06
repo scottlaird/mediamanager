@@ -3,11 +3,13 @@ package ingest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/scottlaird/mediamanager/catalog"
 	"github.com/scottlaird/mediamanager/copyfile"
@@ -269,6 +271,79 @@ func (e *Env) ArchivePlan(ctx context.Context) ([]ArchiveItem, error) {
 		items = append(items, it)
 	}
 	return items, nil
+}
+
+// Select resolves user arguments to assets: each is an asset ID, or a
+// prefix of relpath or kind/relpath as in ListOptions. Unknown arguments
+// are an error rather than silently matching nothing.
+func (e *Env) Select(ctx context.Context, args []string) ([]AssetRef, error) {
+	var refs []AssetRef
+	seen := map[string]bool{}
+	for _, arg := range args {
+		if a, err := e.Catalog.Asset(ctx, arg); err == nil {
+			if !seen[a.ID] {
+				seen[a.ID] = true
+				refs = append(refs, RefOf(a))
+			}
+			continue
+		}
+		matches, err := e.List(ctx, ListOptions{Prefixes: []string{arg}})
+		if err != nil {
+			return nil, err
+		}
+		if len(matches) == 0 {
+			return nil, fmt.Errorf("ingest: %q matches no asset id or path", arg)
+		}
+		for _, m := range matches {
+			if !seen[m.Asset.ID] {
+				seen[m.Asset.ID] = true
+				refs = append(refs, RefOf(m.Asset))
+			}
+		}
+	}
+	return refs, nil
+}
+
+// SpoolSummary is the outcome of SpoolAll.
+type SpoolSummary struct {
+	Spooled  int
+	Skipped  int
+	Failures []Failure
+	Copied   int64
+	Duration time.Duration
+}
+
+// SpoolAll brings assets onto local storage from wherever their best copy
+// is, typically the NAS after a flush, and optionally pins them so the
+// next flush leaves them alone: `mm spool`. Copies run one at a time.
+func (e *Env) SpoolAll(ctx context.Context, refs []AssetRef, pin bool) (*SpoolSummary, error) {
+	e.init()
+	ps, err := e.places(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sum := &SpoolSummary{}
+	for _, ref := range refs {
+		if pin {
+			if err := e.Catalog.SetPinned(ctx, ref.ID, true); err != nil {
+				sum.Failures = append(sum.Failures, Failure{ref.ID, "pin", err})
+				continue
+			}
+		}
+		r, err := e.Spool(ctx, ps, ref.ID)
+		if err != nil {
+			sum.Failures = append(sum.Failures, Failure{ref.ID, "spool", err})
+			continue
+		}
+		if r.Skipped {
+			sum.Skipped++
+			continue
+		}
+		sum.Spooled++
+		sum.Copied += r.Copied
+		sum.Duration += r.Duration
+	}
+	return sum, nil
 }
 
 // SpoolAsset is Spool with location resolution done for the caller.

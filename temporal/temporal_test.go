@@ -103,6 +103,7 @@ func newEnv(t *testing.T, f *fixture) *testsuite.TestWorkflowEnvironment {
 	env.RegisterWorkflow(ArchiveAsset)
 	env.RegisterWorkflow(ArchiveBacklog)
 	env.RegisterWorkflow(FlushSpool)
+	env.RegisterWorkflow(SpoolAssets)
 	env.RegisterActivity(&Activities{Env: f.env})
 	return env
 }
@@ -258,6 +259,51 @@ func TestArchiveAssetResult(t *testing.T) {
 	env.GetWorkflowResult(&ar)
 	if ar.Copies != 0 || len(ar.Skipped) != 1 || ar.Copied != 0 || ar.MiBPerSecond != 0 {
 		t.Errorf("second result %+v", ar)
+	}
+}
+
+func TestSpoolAssetsWorkflow(t *testing.T) {
+	f := newFixture(t, true)
+	card := f.card(t, map[string]int{"A001_C001.braw": 2 * mib, "B001_C001.braw": mib})
+	runImport(t, f, card)
+	env := newEnv(t, f)
+	env.ExecuteWorkflow(FlushSpool, "fast", ingest.FlushOptions{})
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatal(err)
+	}
+	refs, err := f.env.Select(context.Background(), []string{"2026/09/05"})
+	if err != nil || len(refs) != 2 {
+		t.Fatalf("select: %v, %v", refs, err)
+	}
+	env = newEnv(t, f)
+	env.ExecuteWorkflow(SpoolAssets, refs, true, QueuesFor("t"))
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatal(err)
+	}
+	var res SpoolResult
+	env.GetWorkflowResult(&res)
+	if res.Assets != 2 || res.Spooled != 2 || res.Skipped != 0 || len(res.Failures) != 0 || res.Copied != 3*mib || res.MiBPerSecond <= 0 {
+		t.Fatalf("result %+v", res)
+	}
+	st, _ := f.env.Status(context.Background())
+	for _, a := range st.Assets {
+		if a.State != "archived" || !a.Asset.Pinned {
+			t.Errorf("%s: %s pinned=%v", a.Asset.RelPath, a.State, a.Asset.Pinned)
+		}
+	}
+	// Pinned: a flush leaves them alone; a second spool is all skips.
+	env = newEnv(t, f)
+	env.ExecuteWorkflow(FlushSpool, "fast", ingest.FlushOptions{})
+	var fr ingest.FlushReport
+	env.GetWorkflowResult(&fr)
+	if len(fr.Flushed) != 0 {
+		t.Errorf("flushed pinned assets: %+v", fr)
+	}
+	env = newEnv(t, f)
+	env.ExecuteWorkflow(SpoolAssets, refs, false, QueuesFor("t"))
+	env.GetWorkflowResult(&res)
+	if res.Skipped != 2 || res.Spooled != 0 {
+		t.Errorf("second spool %+v", res)
 	}
 }
 

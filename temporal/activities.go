@@ -60,6 +60,16 @@ func (a *Activities) Archive(ctx context.Context, ref ingest.AssetRef) ([]ingest
 	return r, classify(err)
 }
 
+// Pin marks assets to be kept through flushes.
+func (a *Activities) Pin(ctx context.Context, ids []string, pinned bool) error {
+	for _, id := range ids {
+		if err := a.Env.Catalog.SetPinned(ctx, id, pinned); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // NeedsArchive lists assets lacking a NAS copy.
 func (a *Activities) NeedsArchive(ctx context.Context) ([]ingest.AssetRef, error) {
 	return a.Env.NeedsArchiveRefs(ctx)

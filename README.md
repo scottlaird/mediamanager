@@ -43,11 +43,21 @@ mounts a second disk with the same name as `/Volumes/Name 1`.
     mm import /Volumes/CARD            # register, link, spool, archive
     mm status --assets                 # where everything is
     mm flush fast --free 2T            # free spool space, oldest first
+    mm spool 2026/07/10 --pin          # bring a day back from the NAS, keep it
     mm relink                          # repoint links after mounts change
     mm archive                         # finish any NAS copies left over
 
 `mm import` prints whether every file on the card has reached the NAS. It
 never erases a card; format it in the camera.
+
+## Proxies and sidecars
+
+Editors write beside the file they opened, and the file they opened is a
+link. Sidecars (`.sidecar`, `.xmp`) and proxies that appear in the link tree
+are swept into storage beside the original, recorded, copied to the NAS
+with it, and linked back, so pointing Blackmagic Proxy Generator's watch
+folder at `~/Video` produces proxies that follow their clips through
+spool, NAS and flush.
 
 ## Temporal (optional)
 
