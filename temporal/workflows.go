@@ -24,10 +24,15 @@ func QueuesFor(base string) Queues { return Queues{Main: base, NAS: base + "-nas
 
 // Workflow IDs. Fixed per subject so the same card or asset is never worked
 // on twice at once and a second start joins the first.
-func ImportWorkflowID(source string) string   { return "import:" + source }
-func ArchiveWorkflowID(assetID string) string { return "asset:" + assetID }
-func FlushWorkflowID(spool string) string     { return "flush:" + spool }
-func BacklogWorkflowID() string               { return "archive-backlog" }
+func ImportWorkflowID(source string) string { return "import:" + source }
+func FlushWorkflowID(spool string) string   { return "flush:" + spool }
+func BacklogWorkflowID() string             { return "archive-backlog" }
+
+// ArchiveWorkflowID names an archive by the asset's path rather than its
+// identity, so a list of running workflows reads as filenames. The path is
+// unique per asset (the catalog enforces it per kind) and, for video and
+// audio, already carries the identity.
+func ArchiveWorkflowID(ref ingest.AssetRef) string { return "archive:" + ref.Path }
 
 // ImportResult is what ImportSource returns; it is the Temporal form of
 // ingest.Summary.
@@ -159,7 +164,7 @@ func ImportSource(ctx workflow.Context, root string, q Queues) (*ImportResult, e
 // as filenames rather than identities.
 func startArchive(ctx workflow.Context, ref ingest.AssetRef, q Queues) workflow.ChildWorkflowFuture {
 	cctx := workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
-		WorkflowID:            ArchiveWorkflowID(ref.ID),
+		WorkflowID:            ArchiveWorkflowID(ref),
 		TaskQueue:             q.Main,
 		ParentClosePolicy:     enums.PARENT_CLOSE_POLICY_ABANDON,
 		WorkflowIDReusePolicy: enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,

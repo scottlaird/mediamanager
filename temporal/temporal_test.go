@@ -235,6 +235,13 @@ func TestSpoolActivityHeartbeats(t *testing.T) {
 	}
 }
 
+func TestArchiveWorkflowID(t *testing.T) {
+	ref := ingest.AssetRef{ID: "6b09f8b22a45eb03", Path: "video/2026/07/10/a021_07100435_c001-6b09f8b22a45eb03.braw"}
+	if got := ArchiveWorkflowID(ref); got != "archive:video/2026/07/10/a021_07100435_c001-6b09f8b22a45eb03.braw" {
+		t.Errorf("id = %q", got)
+	}
+}
+
 func TestClassify(t *testing.T) {
 	err := classify(fmt.Errorf("wrapped: %w", ingest.ErrSpoolFull))
 	var app *temporal.ApplicationError
