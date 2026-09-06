@@ -1,2 +1,50 @@
 # mediamanager
-Tool for managing import of video and photo files from cameras
+
+Tool for managing import of video, audio and photo files from cameras.
+
+`mm` scans a mounted card or camera, gives every file a permanent,
+content-derived name, links it into a symlink tree the editor can open
+immediately, copies it to a fast local spool and then on to the NAS, and
+later frees the spool once the NAS copy is verified. The editor only ever
+sees the link tree, so files move between tiers without a path changing.
+
+See `DESIGN.md` for the requirements and the rules the code enforces.
+
+## Install
+
+    go install github.com/scottlaird/mediamanager/cmd/mm@latest
+
+## Configure
+
+`~/.config/mediamanager/config.yaml`:
+
+```yaml
+trees:
+  video: {link: ~/Video}
+  audio: {link: ~/Audio}
+  still: {subdir: stills, link: ~/Pictures/Import}
+locations:
+  - name: nas
+    kind: nas
+    path: /Volumes/video/mediamanager
+  - name: fast
+    kind: spool
+    volume_uuid: 1234ABCD-0000-4000-8000-000000000000   # from `mm volume /Volumes/Fast`
+    path: mediamanager                                   # relative to that volume
+    priority: 1
+```
+
+Each location holds one subdirectory per tree, so spools and the NAS
+share a layout. Pin spools to a volume UUID rather than a path: macOS
+mounts a second disk with the same name as `/Volumes/Name 1`.
+
+## Use
+
+    mm import /Volumes/CARD            # register, link, spool, archive
+    mm status --assets                 # where everything is
+    mm flush fast --free 2T            # free spool space, oldest first
+    mm relink                          # repoint links after mounts change
+    mm archive                         # finish any NAS copies left over
+
+`mm import` prints whether every file on the card has reached the NAS. It
+never erases a card; format it in the camera.
