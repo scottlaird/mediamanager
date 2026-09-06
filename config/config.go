@@ -42,7 +42,8 @@ type Config struct {
 // day's video.
 type Tree struct {
 	// Subdir is the directory under each location root. Defaults to the
-	// kind's name.
+	// kind's name. "." puts the tree at the location root itself, for
+	// volumes that hold nothing else.
 	Subdir string `yaml:"subdir"`
 	// Link is the absolute path of the link tree for this kind.
 	Link string `yaml:"link"`
@@ -143,8 +144,8 @@ func (c *Config) finish() error {
 		if t.Subdir == "" {
 			t.Subdir = name
 		}
-		if strings.Contains(t.Subdir, "/") || t.Subdir == "." || t.Subdir == ".." {
-			return fmt.Errorf("tree %q: subdir must be a single directory name", name)
+		if strings.Contains(t.Subdir, "/") || t.Subdir == ".." {
+			return fmt.Errorf("tree %q: subdir must be a single directory name or \".\"", name)
 		}
 		if t.Link == "" {
 			return fmt.Errorf("tree %q: link is required", name)
