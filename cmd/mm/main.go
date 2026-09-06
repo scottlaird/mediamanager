@@ -23,8 +23,21 @@ var (
 )
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sigs := make(chan os.Signal, 2)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigs
+		// First signal: cancel and let the current buffer finish so the
+		// .partial and the catalog agree. A copy blocked inside a slow NAS
+		// syscall cannot notice until it returns, so a second signal quits
+		// outright; the partial is picked up next run either way.
+		fmt.Fprintln(os.Stderr, "mm: stopping after the current buffer; press Ctrl-C again to quit now (the copy resumes next run)")
+		cancel()
+		<-sigs
+		os.Exit(130)
+	}()
 	if err := root().ExecuteContext(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "mm:", err)
 		os.Exit(1)
