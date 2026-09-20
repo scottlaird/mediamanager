@@ -22,6 +22,10 @@ import (
 
 // Error types workflows branch on. Anything else is retried per policy.
 const (
+	// ErrTypeInterrupted: the worker was stopping and cancelled the
+	// activity's context mid-copy. Retryable: the next worker resumes the
+	// copy from its .partial.
+	ErrTypeInterrupted = "Interrupted"
 	// ErrTypeSpoolFull: no spool has room; archive from the source instead.
 	ErrTypeSpoolFull = "SpoolFull"
 	// ErrTypeConflict: the destination holds different content, or the
@@ -37,7 +41,7 @@ type Activities struct {
 // Relink audits and reconciles every link tree.
 func (a *Activities) Relink(ctx context.Context) error {
 	_, err := a.Env.Relink(ctx)
-	return err
+	return classify(err)
 }
 
 // ScanSource registers everything on a mounted source without copying,
@@ -45,7 +49,7 @@ func (a *Activities) Relink(ctx context.Context) error {
 func (a *Activities) ScanSource(ctx context.Context, root string) (*ingest.ScanSummary, error) {
 	src, err := a.Env.ScanSource(ctx, root)
 	if err != nil {
-		return nil, err
+		return nil, classify(err)
 	}
 	return src.Summary(), nil
 }
@@ -88,13 +92,15 @@ func (a *Activities) Archive(ctx context.Context, ref ingest.AssetRef) ([]ingest
 // per item, so a card of thousands of photos costs a few dozen activities
 // rather than thousands. Per-item failures are in the result.
 func (a *Activities) SpoolBatch(ctx context.Context, refs []ingest.AssetRef) ([]ingest.BatchItem, error) {
-	return a.Env.SpoolBatch(batchHeartbeating(ctx), refs)
+	items, err := a.Env.SpoolBatch(batchHeartbeating(ctx), refs)
+	return items, classify(err)
 }
 
 // ArchiveBatch archives a list of small assets in one activity on the NAS
 // queue; one batch holds one NAS slot.
 func (a *Activities) ArchiveBatch(ctx context.Context, refs []ingest.AssetRef) ([]ingest.BatchItem, error) {
-	return a.Env.ArchiveBatch(batchHeartbeating(ctx), refs)
+	items, err := a.Env.ArchiveBatch(batchHeartbeating(ctx), refs)
+	return items, classify(err)
 }
 
 // Pin marks assets to be kept through flushes.
@@ -146,11 +152,16 @@ func batchHeartbeating(ctx context.Context) context.Context {
 }
 
 // classify turns ingest errors that retrying cannot fix into typed,
-// non-retryable application errors.
+// non-retryable application errors, and a worker-shutdown cancellation
+// into a retryable one. Returning context.Canceled itself would record
+// the activity as canceled, which Temporal does not retry, so a worker
+// restart would fail every copy in flight.
 func classify(err error) error {
 	switch {
 	case err == nil:
 		return nil
+	case errors.Is(err, context.Canceled):
+		return temporal.NewApplicationError("interrupted by worker shutdown; will resume", ErrTypeInterrupted, err)
 	case errors.Is(err, ingest.ErrSpoolFull):
 		return temporal.NewNonRetryableApplicationError(err.Error(), ErrTypeSpoolFull, err)
 	case errors.Is(err, copyfile.ErrExists), errors.Is(err, copyfile.ErrSourceMismatch), errors.Is(err, copyfile.ErrVerify):

@@ -201,6 +201,9 @@ func ImportSource(ctx workflow.Context, root string, q Queues) (*ImportResult, e
 		workflow.SetCurrentDetails(ctx, fmt.Sprintf("spooling %d/%d large: %s (%s)", i+1, len(big), ref.Path, fmtBytes(ref.Size)))
 		var archived bool
 		if err := workflow.ExecuteActivity(quick, acts.IsArchived, ref.ID).Get(ctx, &archived); err != nil {
+			if c := stopIfCancelled(ctx); c != nil {
+				return nil, c
+			}
 			res.fail(ref.Path + ": " + err.Error())
 			continue
 		}
@@ -213,6 +216,9 @@ func ImportSource(ctx workflow.Context, root string, q Queues) (*ImportResult, e
 					res.SpoolFull = append(res.SpoolFull, ref.Path)
 				}
 			case err != nil:
+				if c := stopIfCancelled(ctx); c != nil {
+					return nil, c
+				}
 				res.fail(ref.Path + ": spool: " + err.Error())
 				continue
 			case !r.Skipped:
@@ -229,6 +235,9 @@ func ImportSource(ctx workflow.Context, root string, q Queues) (*ImportResult, e
 		workflow.SetCurrentDetails(ctx, fmt.Sprintf("spooling batch %d/%d (%d files)", i+1, len(batches), len(batch)))
 		var items []ingest.BatchItem
 		if err := workflow.ExecuteActivity(withSummary(spool, batchLabel(batch)), acts.SpoolBatch, batch).Get(ctx, &items); err != nil {
+			if c := stopIfCancelled(ctx); c != nil {
+				return nil, c
+			}
 			res.fail(fmt.Sprintf("batch %d: spool: %v", i+1, err))
 			continue
 		}
@@ -282,6 +291,9 @@ func ImportSource(ctx workflow.Context, root string, q Queues) (*ImportResult, e
 	for id, f := range children {
 		var ar ArchiveResult
 		if err := f.Get(ctx, &ar); err != nil {
+			if c := stopIfCancelled(ctx); c != nil {
+				return nil, c // the children are abandoned to finish on their own
+			}
 			if !alreadyRunning(err) {
 				res.fail(id + ": archive: " + err.Error())
 			}
@@ -292,6 +304,9 @@ func ImportSource(ctx workflow.Context, root string, q Queues) (*ImportResult, e
 	for i, f := range batchFutures {
 		var br BatchResult
 		if err := f.Get(ctx, &br); err != nil {
+			if c := stopIfCancelled(ctx); c != nil {
+				return nil, c
+			}
 			res.fail(fmt.Sprintf("archive batch %d: %v", i+1, err))
 			continue
 		}
@@ -539,6 +554,9 @@ func ArchiveBacklog(ctx workflow.Context, q Queues) (*BacklogResult, error) {
 	for id, f := range futures {
 		var ar ArchiveResult
 		if err := f.Get(ctx, &ar); err != nil {
+			if c := stopIfCancelled(ctx); c != nil {
+				return nil, c
+			}
 			if !alreadyRunning(err) {
 				res.Failed++
 				if len(res.Failures) < maxListed {
@@ -554,6 +572,9 @@ func ArchiveBacklog(ctx workflow.Context, q Queues) (*BacklogResult, error) {
 	for i, f := range batches {
 		var br BatchResult
 		if err := f.Get(ctx, &br); err != nil {
+			if c := stopIfCancelled(ctx); c != nil {
+				return nil, c
+			}
 			res.Failed++
 			if len(res.Failures) < maxListed {
 				res.Failures = append(res.Failures, fmt.Sprintf("batch %d: %v", i+1, err))
@@ -588,6 +609,17 @@ func FlushSpool(ctx workflow.Context, spool string, opts ingest.FlushOptions) (i
 	fo.HeartbeatTimeout = 0
 	err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, fo), acts.Flush, spool, opts).Get(ctx, &rep)
 	return rep, err
+}
+
+// stopIfCancelled returns the workflow's cancellation, if any, so a loop
+// that tolerates per-asset failures still ends promptly and as cancelled
+// when the workflow itself is cancelled, rather than recording every
+// remaining asset as failed.
+func stopIfCancelled(ctx workflow.Context) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return nil
 }
 
 func isType(err error, typ string) bool {
@@ -661,6 +693,9 @@ func SpoolAssets(ctx workflow.Context, refs []ingest.AssetRef, pin bool, q Queue
 	for i, f := range futures {
 		var r ingest.CopyResult
 		if err := f.Get(ctx, &r); err != nil {
+			if c := stopIfCancelled(ctx); c != nil {
+				return nil, c
+			}
 			fail(big[i].Path + ": " + err.Error())
 			continue
 		}
@@ -675,6 +710,9 @@ func SpoolAssets(ctx workflow.Context, refs []ingest.AssetRef, pin bool, q Queue
 	for i, f := range bfutures {
 		var items []ingest.BatchItem
 		if err := f.Get(ctx, &items); err != nil {
+			if c := stopIfCancelled(ctx); c != nil {
+				return nil, c
+			}
 			fail(fmt.Sprintf("batch %d: %v", i+1, err))
 			continue
 		}

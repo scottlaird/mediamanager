@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -371,6 +372,35 @@ func TestImportManySmallFilesGoesThroughBatches(t *testing.T) {
 	}
 }
 
+func TestCancelledImportEndsCancelled(t *testing.T) {
+	f := newFixture(t, true)
+	f.env.Config.Trees["still"] = config.Tree{Subdir: "stills", Link: filepath.Join(f.links, "still")}
+	files := map[string]int{}
+	for i := 0; i < 120; i++ {
+		files[fmt.Sprintf("DCIM/100HASBL/B%07d.3FR", i)] = 64 * 1024
+	}
+	card := f.card(t, files)
+	env := newEnv(t, f)
+	// Cancel as soon as the first batch starts spooling.
+	var once sync.Once
+	env.SetOnActivityStartedListener(func(info *activity.Info, ctx context.Context, args converter.EncodedValues) {
+		if info.ActivityType.Name == "SpoolBatch" {
+			once.Do(func() { go env.CancelWorkflow() })
+		}
+	})
+	env.ExecuteWorkflow(ImportSource, card, QueuesFor("t"))
+	if !env.IsWorkflowCompleted() {
+		t.Fatal("did not finish")
+	}
+	err := env.GetWorkflowError()
+	var canceled *temporal.CanceledError
+	if !errors.As(err, &canceled) {
+		var res ImportResult
+		env.GetWorkflowResult(&res)
+		t.Fatalf("cancelled import ended with %v (result %+v); want CanceledError", err, res)
+	}
+}
+
 func TestArchiveWorkflowID(t *testing.T) {
 	ref := ingest.AssetRef{ID: "6b09f8b22a45eb03", Path: "video/2026/07/10/a021_07100435_c001-6b09f8b22a45eb03.braw"}
 	if got := ArchiveWorkflowID(ref); got != "archive:video/2026/07/10/a021_07100435_c001-6b09f8b22a45eb03.braw" {
@@ -390,6 +420,16 @@ func TestClassify(t *testing.T) {
 	plain := errors.New("disk on fire")
 	if classify(plain) != plain {
 		t.Error("ordinary error rewritten")
+	}
+	// A worker shutdown cancels the activity context; that must come back
+	// retryable, not as a cancellation Temporal would treat as final.
+	shut := classify(fmt.Errorf("copy: %w", context.Canceled))
+	if !errors.As(shut, &app) || app.Type() != ErrTypeInterrupted || app.NonRetryable() {
+		t.Errorf("shutdown -> %v", shut)
+	}
+	var canceled *temporal.CanceledError
+	if errors.As(shut, &canceled) {
+		t.Error("shutdown classified as a cancellation")
 	}
 	if !isType(err, ErrTypeSpoolFull) || isType(plain, ErrTypeSpoolFull) {
 		t.Error("isType")
