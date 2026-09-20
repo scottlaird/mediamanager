@@ -115,8 +115,12 @@ func ProxyPath(rel, ext string) string {
 // the same name with the extension swapped for ext (sidecar, xmp).
 func SidecarPath(rel, ext string) string {
 	dir, name := path.Split(rel)
+	ext = Sanitize(ext)
+	if ext == "phos" { // Phocus keeps the original's name whole: x.3fr.phos
+		return path.Join(dir, name+"."+ext)
+	}
 	base, _ := splitExt(name)
-	return path.Join(dir, join(base, Sanitize(ext)))
+	return path.Join(dir, join(base, ext))
 }
 
 // ProxySidecarPath returns the path of a sidecar beside the proxy of rel.

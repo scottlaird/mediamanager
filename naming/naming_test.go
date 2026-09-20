@@ -102,6 +102,9 @@ func TestSidecarPaths(t *testing.T) {
 	if got := SidecarPath("2026/09/05/l1004821.rw2", "XMP"); got != "2026/09/05/l1004821.xmp" {
 		t.Errorf("SidecarPath xmp = %q", got)
 	}
+	if got := SidecarPath("2026/09/18/b0002567.3fr", "phos"); got != "2026/09/18/b0002567.3fr.phos" {
+		t.Errorf("SidecarPath phos = %q", got)
+	}
 	if got := ProxySidecarPath(rel, "sidecar"); got != "2026/09/05/Proxy/a001-3f9a1c2e7b4d5a60.sidecar" {
 		t.Errorf("ProxySidecarPath = %q", got)
 	}

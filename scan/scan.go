@@ -75,7 +75,12 @@ func (f File) IsOriginal() bool { return f.Role == Original }
 func (f File) Base() string {
 	name := path.Base(f.Rel)
 	if i := strings.LastIndexByte(name, '.'); i > 0 {
-		return name[:i]
+		name = name[:i]
+	}
+	if KeepsOriginalExt(f.Ext) {
+		if i := strings.LastIndexByte(name, '.'); i > 0 {
+			name = name[:i]
+		}
 	}
 	return name
 }
@@ -174,8 +179,14 @@ func Scan(root string, c *Classifier) (Result, error) {
 }
 
 // SidecarExts are the metadata files editors write beside media:
-// Blackmagic's .sidecar for BRAW and Adobe's .xmp for stills.
-var SidecarExts = map[string]bool{"sidecar": true, "xmp": true}
+// Blackmagic's .sidecar for BRAW, Adobe's .xmp for stills, Hasselblad
+// Phocus's .phos. A .phos keeps the original's full name in front of it
+// (b0002567.3fr.phos), which Base and naming.SidecarPath both know.
+var SidecarExts = map[string]bool{"sidecar": true, "xmp": true, "phos": true}
+
+// KeepsOriginalExt reports whether a sidecar extension is appended to the
+// original's whole name rather than replacing its extension.
+func KeepsOriginalExt(ext string) bool { return strings.ToLower(ext) == "phos" }
 
 // IsSidecarExt reports whether a lowercase extension names a sidecar.
 func IsSidecarExt(ext string) bool { return SidecarExts[strings.ToLower(ext)] }
