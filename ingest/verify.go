@@ -36,8 +36,8 @@ type VerifyOptions struct {
 type VerifyItem struct {
 	Path     string
 	Location string
-	// Result is one of: missing, size, identity, hash, updated, replaced,
-	// unresolved.
+	// Result is one of: missing, size, identity, hash, conflict, recorded,
+	// updated, replaced, unresolved.
 	Result string
 	Detail string
 }
@@ -94,6 +94,9 @@ type verifyResult struct {
 	ok         bool
 	read       int64
 	start, end time.Time
+	// hash is the full hash computed for a copy whose asset had no
+	// reference; the copies are compared with each other afterwards.
+	hash string
 }
 
 // verifyProgress is shared by the readers: bytes read so far, updated as
@@ -174,13 +177,13 @@ func (e *Env) Verify(ctx context.Context, refs []AssetRef, opts VerifyOptions) (
 			for j := range in {
 				t0 := time.Now()
 				var counted int64
-				it, ok := e.checkCopy(j.asset, j.copy, j.path, opts.Full, func(n int64) { counted += n; vp.read.Add(n) })
+				it, ok, hash := e.checkCopy(j.asset, j.copy, j.path, opts.Full, func(n int64) { counted += n; vp.read.Add(n) })
 				// Sparse checks and stats do not report through the
 				// callback; credit whatever the callback did not.
 				if expect := bytesToRead(j.asset, opts.Full); counted < expect {
 					vp.read.Add(expect - counted)
 				}
-				out <- verifyResult{job: j, item: it, ok: ok, read: bytesToRead(j.asset, opts.Full), start: t0, end: time.Now()}
+				out <- verifyResult{job: j, item: it, ok: ok, read: bytesToRead(j.asset, opts.Full), start: t0, end: time.Now(), hash: hash}
 			}
 		}()
 	}
@@ -245,6 +248,42 @@ func (e *Env) Verify(ctx context.Context, refs []AssetRef, opts VerifyOptions) (
 			continue
 		}
 		a := assets[ref.ID]
+		if opts.Full && a.FullSHA256 == "" {
+			// No reference hash: the copies vouch for each other. All
+			// agreeing means the hash is recorded; disagreement is
+			// reported on every copy, since nothing says which is right.
+			hashes := map[string]int{}
+			for _, r := range results {
+				if r.ok && r.hash != "" {
+					hashes[r.hash]++
+				}
+			}
+			switch len(hashes) {
+			case 1:
+				for h := range hashes {
+					if err := e.Catalog.SetFullSHA256(ctx, a.ID, h); err != nil {
+						return rep, err
+					}
+					for i := range results {
+						if results[i].ok {
+							_ = e.Catalog.PutCopy(ctx, withHash(results[i].job.copy, h))
+						}
+					}
+					rep.Items = append(rep.Items, VerifyItem{Path: a.Kind.String() + "/" + a.RelPath, Location: "*",
+						Result: "recorded", Detail: fmt.Sprintf("full hash %s… recorded from %d agreeing copies", h[:16], hashes[h])})
+				}
+			default:
+				if len(hashes) > 1 {
+					for i := range results {
+						if results[i].ok && results[i].hash != "" {
+							results[i].ok = false
+							results[i].item.Result = "conflict"
+							results[i].item.Detail = fmt.Sprintf("sha256 %s…; copies disagree and the catalog has no reference", results[i].hash[:16])
+						}
+					}
+				}
+			}
+		}
 		var changed, intact []catalog.Copy
 		for _, r := range results {
 			cp := r.job.copy
@@ -261,7 +300,9 @@ func (e *Env) Verify(ctx context.Context, refs []AssetRef, opts VerifyOptions) (
 				rep.Missing++
 			} else {
 				rep.Mismatch++
-				changed = append(changed, cp)
+				if r.item.Result != "conflict" {
+					changed = append(changed, cp)
+				}
 			}
 			rep.Items = append(rep.Items, r.item)
 			if err := e.Catalog.SetCopyState(ctx, a.ID, cp.LocationID, catalog.Mismatch); err != nil {
@@ -345,31 +386,32 @@ func bytesToRead(a catalog.Asset, full bool) int64 {
 
 // checkCopy compares one file with the catalog. ok is true when it
 // matches. progress, if set, is told about bytes as a full hash reads
-// them.
-func (e *Env) checkCopy(a catalog.Asset, cp catalog.Copy, path string, full bool, progress func(int64)) (VerifyItem, bool) {
-	it := VerifyItem{Path: a.Kind.String() + "/" + a.RelPath, Location: cp.Location.Name}
+// them. With full, the hash is returned even when the catalog holds no
+// reference, so the caller can compare copies with each other.
+func (e *Env) checkCopy(a catalog.Asset, cp catalog.Copy, path string, full bool, progress func(int64)) (it VerifyItem, ok bool, hash string) {
+	it = VerifyItem{Path: a.Kind.String() + "/" + a.RelPath, Location: cp.Location.Name}
 	st, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		it.Result, it.Detail = "missing", path
-		return it, false
+		return it, false, ""
 	}
 	if err != nil {
 		it.Result, it.Detail = "missing", err.Error()
-		return it, false
+		return it, false, ""
 	}
 	if st.Size() != a.Size {
 		it.Result, it.Detail = "size", fmt.Sprintf("%d bytes on disk, catalog says %d", st.Size(), a.Size)
-		return it, false
+		return it, false, ""
 	}
 	if a.Kind.UsesSparseID() {
 		id, _, err := identity.SparseFile(path)
 		if err != nil {
 			it.Result, it.Detail = "missing", err.Error()
-			return it, false
+			return it, false, ""
 		}
 		if string(id) != a.ID {
 			it.Result, it.Detail = "identity", fmt.Sprintf("sparse identity %s, catalog says %s", id, a.ID)
-			return it, false
+			return it, false, ""
 		}
 	}
 	if full {
@@ -377,19 +419,24 @@ func (e *Env) checkCopy(a catalog.Asset, cp catalog.Copy, path string, full bool
 		if want == "" && !a.Kind.UsesSparseID() {
 			want = a.ID // stills: the ID is the original hash
 		}
-		if want != "" {
-			sum, err := identity.FullFileProgress(path, progress)
-			if err != nil {
-				it.Result, it.Detail = "missing", err.Error()
-				return it, false
-			}
-			if sum != want {
-				it.Result, it.Detail = "hash", fmt.Sprintf("sha256 %s…, catalog says %s…", sum[:16], want[:16])
-				return it, false
-			}
+		sum, err := identity.FullFileProgress(path, progress)
+		if err != nil {
+			it.Result, it.Detail = "missing", err.Error()
+			return it, false, ""
 		}
+		if want != "" && sum != want {
+			it.Result, it.Detail = "hash", fmt.Sprintf("sha256 %s…, catalog says %s…", sum[:16], want[:16])
+			return it, false, sum
+		}
+		return it, true, sum
 	}
-	return it, true
+	return it, true, ""
+}
+
+func withHash(cp catalog.Copy, h string) catalog.Copy {
+	cp.FullSHA256 = h
+	cp.State = catalog.Complete
+	return cp
 }
 
 // adoptEdit takes the changed copy as the asset's new content and brings
