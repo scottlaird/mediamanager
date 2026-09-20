@@ -104,14 +104,14 @@ func importViaTemporal(ctx context.Context, c client.Client, q mmtemporal.Queues
 
 func printImportResult(w *os.File, src string, r *mmtemporal.ImportResult) {
 	fmt.Fprintf(w, "%s (%s): %d assets, %d new, %d spooled, %d archived\n", src, r.Shape, r.Assets, r.New, r.Spooled, r.Archived)
-	for _, rel := range r.Unrouted {
-		fmt.Fprintf(w, "  skipped (no tree for its kind): %s\n", rel)
+	if r.Unrouted > 0 {
+		fmt.Fprintf(w, "  %d skipped (no tree for their kind); a tree added to the config takes effect only after mm worker is restarted\n", r.Unrouted)
 	}
-	if len(r.Unrouted) > 0 {
-		fmt.Fprintf(w, "  (a tree added to the config takes effect only after mm worker is restarted)\n")
+	if r.Orphans > 0 {
+		fmt.Fprintf(w, "  %d proxies or sidecars without an original\n", r.Orphans)
 	}
-	for _, rel := range r.Orphans {
-		fmt.Fprintf(w, "  proxy or sidecar without an original: %s\n", rel)
+	for _, rel := range r.Examples {
+		fmt.Fprintf(w, "    e.g. %s\n", rel)
 	}
 	if r.Unrecognised > 0 {
 		fmt.Fprintf(w, "  %d unrecognised files ignored\n", r.Unrecognised)
@@ -121,6 +121,9 @@ func printImportResult(w *os.File, src string, r *mmtemporal.ImportResult) {
 	}
 	for _, f := range r.Failures {
 		fmt.Fprintf(w, "  FAILED %s\n", f)
+	}
+	if r.Failed > len(r.Failures) {
+		fmt.Fprintf(w, "  ... and %d more failures\n", r.Failed-len(r.Failures))
 	}
 	if r.SafeToFormat {
 		fmt.Fprintf(w, "  every file is on the NAS; safe to format in camera\n")

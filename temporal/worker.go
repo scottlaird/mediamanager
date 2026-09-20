@@ -43,6 +43,7 @@ func RunWorker(ctx context.Context, c client.Client, env *ingest.Env, q Queues, 
 	main.RegisterWorkflow(ArchiveBacklog)
 	main.RegisterWorkflow(FlushSpool)
 	main.RegisterWorkflow(SpoolAssets)
+	main.RegisterWorkflow(ArchiveBatch)
 	main.RegisterActivity(acts)
 
 	if nasSlots <= 0 {

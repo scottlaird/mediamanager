@@ -373,6 +373,171 @@ func (e *Env) IsArchived(ctx context.Context, id string) (bool, error) {
 	return e.archived(ctx, ps, id)
 }
 
+// Refs describes assets by ID, in the order given; unknown IDs are
+// skipped. It is how a workflow turns a compact ID list back into what
+// activities need, a page at a time.
+func (e *Env) Refs(ctx context.Context, ids []string) ([]AssetRef, error) {
+	refs := make([]AssetRef, 0, len(ids))
+	for _, id := range ids {
+		a, err := e.Catalog.Asset(ctx, id)
+		if errors.Is(err, catalog.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		refs = append(refs, RefOf(a))
+	}
+	return refs, nil
+}
+
+// SourceAssetIDs pages the assets recorded on a source location by name.
+func (e *Env) SourceAssetIDs(ctx context.Context, source string, offset, limit int) ([]string, error) {
+	loc, err := e.Catalog.LocationByName(ctx, source)
+	if err != nil {
+		return nil, err
+	}
+	return e.Catalog.SourceAssetIDs(ctx, loc.ID, offset, limit)
+}
+
+// NeedsArchivePage pages the IDs of assets lacking a NAS copy.
+func (e *Env) NeedsArchivePage(ctx context.Context, offset, limit int) ([]string, error) {
+	return e.Catalog.NeedsArchiveIDs(ctx, offset, limit)
+}
+
+// AllArchivedOn reports whether every asset recorded on a source location
+// has a complete copy on a mounted NAS: the safe-to-format check, done
+// catalog-side so no list crosses a process boundary.
+func (e *Env) AllArchivedOn(ctx context.Context, source string) (bool, error) {
+	ps, err := e.places(ctx)
+	if err != nil {
+		return false, err
+	}
+	loc, err := e.Catalog.LocationByName(ctx, source)
+	if err != nil {
+		return false, err
+	}
+	n := 0
+	for offset := 0; ; offset += 1000 {
+		ids, err := e.Catalog.SourceAssetIDs(ctx, loc.ID, offset, 1000)
+		if err != nil {
+			return false, err
+		}
+		if len(ids) == 0 {
+			break
+		}
+		for _, id := range ids {
+			ok, err := e.archived(ctx, ps, id)
+			if err != nil || !ok {
+				return false, err
+			}
+			n++
+		}
+	}
+	return n > 0, nil
+}
+
+// BatchItem is the outcome of one asset within a batch step. Errors are
+// carried as text so a batch's result stays a plain value.
+type BatchItem struct {
+	ID        string
+	Path      string
+	Skipped   bool
+	SpoolFull bool
+	Err       string
+	Copies    int
+	Copied    int64
+	Duration  time.Duration
+}
+
+// SpoolBatch spools each asset in turn (one reader per source) and reports
+// per asset. A full spool is recorded per item rather than stopping the
+// batch. The progress callback, if any, is told which item is running.
+func (e *Env) SpoolBatch(ctx context.Context, refs []AssetRef) ([]BatchItem, error) {
+	e.init()
+	ps, err := e.places(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]BatchItem, 0, len(refs))
+	for i, ref := range refs {
+		it := BatchItem{ID: ref.ID, Path: ref.Path}
+		r, err := e.Spool(withBatchProgress(ctx, ref, i, len(refs)), ps, ref.ID)
+		switch {
+		case errors.Is(err, ErrSpoolFull):
+			it.SpoolFull = true
+		case err != nil:
+			if ctx.Err() != nil {
+				return out, ctx.Err()
+			}
+			it.Err = err.Error()
+		default:
+			it.Skipped, it.Copied, it.Duration = r.Skipped, r.Copied, r.Duration
+		}
+		out = append(out, it)
+	}
+	return out, nil
+}
+
+// ArchiveBatch archives each asset in turn and reports per asset.
+func (e *Env) ArchiveBatch(ctx context.Context, refs []AssetRef) ([]BatchItem, error) {
+	e.init()
+	ps, err := e.places(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]BatchItem, 0, len(refs))
+	for i, ref := range refs {
+		it := BatchItem{ID: ref.ID, Path: ref.Path}
+		results, err := e.Archive(withBatchProgress(ctx, ref, i, len(refs)), ps, ref.ID)
+		if err != nil {
+			if ctx.Err() != nil {
+				return out, ctx.Err()
+			}
+			it.Err = err.Error()
+		}
+		for _, r := range results {
+			if r.Skipped {
+				continue
+			}
+			it.Copies++
+			it.Copied += r.Copied
+			it.Duration += r.Duration
+		}
+		it.Skipped = it.Err == "" && it.Copies == 0
+		out = append(out, it)
+	}
+	return out, nil
+}
+
+// BatchProgress is what a batch step reports as it moves through its
+// items, when the caller attached a callback with WithBatchProgress.
+type BatchProgress struct {
+	Ref   AssetRef
+	Index int
+	Count int
+	Done  int64
+	Total int64
+}
+
+type batchProgressKey struct{}
+
+// WithBatchProgress attaches a per-item progress callback for the batch
+// steps; a plain WithProgress callback still receives byte counts too.
+func WithBatchProgress(ctx context.Context, fn func(BatchProgress)) context.Context {
+	return context.WithValue(ctx, batchProgressKey{}, fn)
+}
+
+func withBatchProgress(ctx context.Context, ref AssetRef, i, n int) context.Context {
+	fn, _ := ctx.Value(batchProgressKey{}).(func(BatchProgress))
+	if fn == nil {
+		return ctx
+	}
+	return WithProgress(ctx, func(done, total int64) {
+		fn(BatchProgress{Ref: ref, Index: i, Count: n, Done: done, Total: total})
+	})
+}
+
 // NeedsArchiveRefs lists assets lacking a NAS copy, oldest capture first.
 func (e *Env) NeedsArchiveRefs(ctx context.Context) ([]AssetRef, error) {
 	assets, err := e.Catalog.NeedsArchive(ctx)

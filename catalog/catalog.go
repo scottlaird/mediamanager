@@ -568,6 +568,51 @@ func (c *DB) AssetsByKind(ctx context.Context, kind media.Kind) ([]Asset, error)
 	return c.assets(ctx, `SELECT `+assetCols+` FROM assets WHERE kind = ? ORDER BY relpath`, kind.String())
 }
 
+// SourceAssetIDs pages through the distinct assets recorded on a source
+// location, in path order, so a workflow can walk a card of any size
+// without holding its listing.
+func (c *DB) SourceAssetIDs(ctx context.Context, locationID int64, offset, limit int) ([]string, error) {
+	rows, err := c.db.QueryContext(ctx, `
+		SELECT asset_id FROM source_files WHERE location_id = ?
+		GROUP BY asset_id ORDER BY MIN(path) LIMIT ? OFFSET ?`, locationID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// NeedsArchiveIDs pages through NeedsArchive by ID only.
+func (c *DB) NeedsArchiveIDs(ctx context.Context, offset, limit int) ([]string, error) {
+	rows, err := c.db.QueryContext(ctx, `
+		SELECT id FROM assets a
+		WHERE EXISTS (SELECT 1 FROM copies c WHERE c.asset_id = a.id AND c.state = 'complete')
+		  AND NOT EXISTS (SELECT 1 FROM copies c JOIN locations l ON l.id = c.location_id
+		                  WHERE c.asset_id = a.id AND c.state = 'complete' AND l.kind = 'nas')
+		ORDER BY capture_time, id LIMIT ? OFFSET ?`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // AllLocations lists every location of every kind.
 func (c *DB) AllLocations(ctx context.Context) ([]Location, error) {
 	rows, err := c.db.QueryContext(ctx,

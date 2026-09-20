@@ -27,6 +27,7 @@ func QueuesFor(base string) Queues { return Queues{Main: base, NAS: base + "-nas
 func ImportWorkflowID(source string) string { return "import:" + source }
 func FlushWorkflowID(spool string) string   { return "flush:" + spool }
 func BacklogWorkflowID() string             { return "archive-backlog" }
+func SpoolWorkflowID(tag string) string     { return "spool:" + tag }
 
 // ArchiveWorkflowID names an archive by the asset's path rather than its
 // identity, so a list of running workflows reads as filenames. The path is
@@ -34,8 +35,26 @@ func BacklogWorkflowID() string             { return "archive-backlog" }
 // audio, already carries the identity.
 func ArchiveWorkflowID(ref ingest.AssetRef) string { return "archive:" + ref.Path }
 
+// Sizing. Temporal caps a payload at 2 MiB and a workflow history at
+// ~50K events, and a stills card can hold thousands of files, so:
+const (
+	// refPage is how many asset IDs one Refs activity expands.
+	refPage = 200
+	// batchSize is how many small assets one SpoolBatch or ArchiveBatch
+	// activity handles.
+	batchSize = 50
+	// batchBelow is the size under which an asset goes through a batch
+	// rather than its own activity and archive workflow. Above it, the
+	// per-file workflow with its own ID, heartbeat and result is worth
+	// the history it costs.
+	batchBelow = 1 << 30
+	// maxListed bounds the per-file lists carried in a result.
+	maxListed = 50
+)
+
 // ImportResult is what ImportSource returns; it is the Temporal form of
-// ingest.Summary.
+// ingest.Summary. Per-file lists are capped at maxListed entries; the
+// counts are exact.
 type ImportResult struct {
 	Source       string
 	Shape        string
@@ -44,11 +63,20 @@ type ImportResult struct {
 	Spooled      int
 	Archived     int
 	SpoolFull    []string
+	Failed       int
 	Failures     []string
-	Unrouted     []string
-	Orphans      []string
+	Unrouted     int
+	Orphans      int
 	Unrecognised int
+	Examples     []string
 	SafeToFormat bool
+}
+
+func (r *ImportResult) fail(msg string) {
+	r.Failed++
+	if len(r.Failures) < maxListed {
+		r.Failures = append(r.Failures, msg)
+	}
 }
 
 var (
@@ -69,12 +97,68 @@ var (
 	}
 )
 
+// idPage is how many IDs one paging activity returns.
+const idPage = 1000
+
+// pageIDs drains a paged ID activity into one slice held in workflow
+// memory (never in one payload).
+func pageIDs(ctx workflow.Context, fetch func(offset, limit int) workflow.Future) ([]string, error) {
+	var all []string
+	for offset := 0; ; offset += idPage {
+		var page []string
+		if err := fetch(offset, idPage).Get(ctx, &page); err != nil {
+			return nil, err
+		}
+		all = append(all, page...)
+		if len(page) < idPage {
+			return all, nil
+		}
+	}
+}
+
+// refsFor expands asset IDs into refs, a page at a time.
+func refsFor(ctx workflow.Context, ids []string) ([]ingest.AssetRef, error) {
+	var acts *Activities
+	quick := workflow.WithActivityOptions(ctx, quickOpts)
+	out := make([]ingest.AssetRef, 0, len(ids))
+	for i := 0; i < len(ids); i += refPage {
+		end := min(i+refPage, len(ids))
+		var page []ingest.AssetRef
+		if err := workflow.ExecuteActivity(quick, acts.Refs, ids[i:end]).Get(ctx, &page); err != nil {
+			return nil, err
+		}
+		out = append(out, page...)
+	}
+	return out, nil
+}
+
+// split separates refs into those that get their own workflow and those
+// handled in batches.
+func split(refs []ingest.AssetRef) (big, small []ingest.AssetRef) {
+	for _, r := range refs {
+		if r.Size >= batchBelow {
+			big = append(big, r)
+		} else {
+			small = append(small, r)
+		}
+	}
+	return big, small
+}
+
+func chunks(refs []ingest.AssetRef) [][]ingest.AssetRef {
+	var out [][]ingest.AssetRef
+	for i := 0; i < len(refs); i += batchSize {
+		out = append(out, refs[i:min(i+batchSize, len(refs))])
+	}
+	return out
+}
+
 // ImportSource is one card or camera, start to finish: audit, register,
-// link, spool each asset in turn (one reader per source), and hand each
-// to its own ArchiveAsset workflow. Those children outlive this workflow
-// if it is cancelled, so pulling a card never stops a NAS copy already
-// under way. Anything already needing archive from earlier runs is handed
-// off too. The result mirrors ingest.Summary.
+// link, spool (one reader per source), and hand everything to archive
+// workflows that outlive this one, so pulling a card never stops a NAS
+// copy already under way. Large files get a Spool activity and an
+// ArchiveAsset workflow each; small ones go through batches. Anything
+// already needing archive from earlier runs is handed off too.
 func ImportSource(ctx workflow.Context, root string, q Queues) (*ImportResult, error) {
 	var acts *Activities
 	quick := workflow.WithActivityOptions(ctx, quickOpts)
@@ -83,34 +167,44 @@ func ImportSource(ctx workflow.Context, root string, q Queues) (*ImportResult, e
 	if err := workflow.ExecuteActivity(quick, acts.Relink).Get(ctx, nil); err != nil {
 		return nil, err
 	}
-	var src ingest.Source
-	if err := workflow.ExecuteActivity(quick, acts.ScanSource, root).Get(ctx, &src); err != nil {
+	var scan ingest.ScanSummary
+	if err := workflow.ExecuteActivity(quick, acts.ScanSource, root).Get(ctx, &scan); err != nil {
 		return nil, err
 	}
 	res := &ImportResult{
-		Source: src.Loc.Name, Shape: src.Shape.String(), Assets: len(src.Assets), New: len(src.New),
-		Unrouted: src.Unrouted, Orphans: src.Orphans, Unrecognised: len(src.Unrecognised),
+		Source: scan.Source, Shape: scan.Shape, Assets: scan.Assets, New: scan.New,
+		Unrouted: scan.Unrouted, Orphans: scan.Orphans, Unrecognised: scan.Unrecognised, Examples: scan.Examples,
 	}
 	if err := workflow.ExecuteActivity(quick, acts.Relink).Get(ctx, nil); err != nil {
 		return nil, err
 	}
+	ids, err := pageIDs(ctx, func(offset, limit int) workflow.Future {
+		return workflow.ExecuteActivity(quick, acts.SourceAssetIDs, scan.Source, offset, limit)
+	})
+	if err != nil {
+		return nil, err
+	}
+	refs, err := refsFor(ctx, dedupe(ids))
+	if err != nil {
+		return nil, err
+	}
+	big, small := split(refs)
 
 	children := map[string]workflow.ChildWorkflowFuture{}
 	handoff := func(ref ingest.AssetRef) {
-		if _, done := children[ref.ID]; done {
-			return
+		if _, done := children[ref.ID]; !done {
+			children[ref.ID] = startArchive(ctx, ref, q)
 		}
-		children[ref.ID] = startArchive(ctx, ref, q)
 	}
-	refs := src.Refs
-	for i, ref := range refs {
-		if _, seen := children[ref.ID]; seen {
-			continue // same content under two names on one card
-		}
-		workflow.SetCurrentDetails(ctx, fmt.Sprintf("spooling %d/%d: %s (%s)", i+1, len(refs), ref.Path, fmtBytes(ref.Size)))
+	// Large files first, one at a time: a card reader is one stream.
+	for i, ref := range big {
+		workflow.SetCurrentDetails(ctx, fmt.Sprintf("spooling %d/%d large: %s (%s)", i+1, len(big), ref.Path, fmtBytes(ref.Size)))
 		var archived bool
 		if err := workflow.ExecuteActivity(quick, acts.IsArchived, ref.ID).Get(ctx, &archived); err != nil {
-			res.Failures = append(res.Failures, ref.Path+": "+err.Error())
+			if c := stopIfCancelled(ctx); c != nil {
+				return nil, c
+			}
+			res.fail(ref.Path + ": " + err.Error())
 			continue
 		}
 		if !archived {
@@ -118,9 +212,14 @@ func ImportSource(ctx workflow.Context, root string, q Queues) (*ImportResult, e
 			err := workflow.ExecuteActivity(withSummary(spool, ref.Path), acts.Spool, ref).Get(ctx, &r)
 			switch {
 			case isType(err, ErrTypeSpoolFull):
-				res.SpoolFull = append(res.SpoolFull, ref.Path)
+				if len(res.SpoolFull) < maxListed {
+					res.SpoolFull = append(res.SpoolFull, ref.Path)
+				}
 			case err != nil:
-				res.Failures = append(res.Failures, ref.Path+": spool: "+err.Error())
+				if c := stopIfCancelled(ctx); c != nil {
+					return nil, c
+				}
+				res.fail(ref.Path + ": spool: " + err.Error())
 				continue
 			case !r.Skipped:
 				res.Spooled++
@@ -128,35 +227,127 @@ func ImportSource(ctx workflow.Context, root string, q Queues) (*ImportResult, e
 		}
 		handoff(ref) // a no-op copy for archived assets, but it refreshes sidecars
 	}
-	var leftovers []ingest.AssetRef
-	if err := workflow.ExecuteActivity(quick, acts.NeedsArchive).Get(ctx, &leftovers); err == nil {
-		for _, ref := range leftovers {
-			handoff(ref)
+	// Small files in batches: one activity spools fifty, one child
+	// workflow archives them.
+	batches := chunks(small)
+	var batchFutures []workflow.ChildWorkflowFuture
+	for i, batch := range batches {
+		workflow.SetCurrentDetails(ctx, fmt.Sprintf("spooling batch %d/%d (%d files)", i+1, len(batches), len(batch)))
+		var items []ingest.BatchItem
+		if err := workflow.ExecuteActivity(withSummary(spool, batchLabel(batch)), acts.SpoolBatch, batch).Get(ctx, &items); err != nil {
+			if c := stopIfCancelled(ctx); c != nil {
+				return nil, c
+			}
+			res.fail(fmt.Sprintf("batch %d: spool: %v", i+1, err))
+			continue
+		}
+		var toArchive []ingest.AssetRef
+		for j, it := range items {
+			switch {
+			case it.SpoolFull:
+				if len(res.SpoolFull) < maxListed {
+					res.SpoolFull = append(res.SpoolFull, it.Path)
+				}
+			case it.Err != "":
+				res.fail(it.Path + ": spool: " + it.Err)
+				continue
+			case !it.Skipped:
+				res.Spooled++
+			}
+			toArchive = append(toArchive, batch[j])
+		}
+		if len(toArchive) > 0 {
+			batchFutures = append(batchFutures, startArchiveBatch(ctx, toArchive, q))
 		}
 	}
-	workflow.SetCurrentDetails(ctx, fmt.Sprintf("waiting for %d archive workflows", len(children)))
+
+	// Leftovers from earlier runs, wherever their copy is now.
+	leftoverIDs, err := pageIDs(ctx, func(offset, limit int) workflow.Future {
+		return workflow.ExecuteActivity(quick, acts.NeedsArchive, offset, limit)
+	})
+	if err == nil {
+		seen := map[string]bool{}
+		for _, r := range refs {
+			seen[r.ID] = true
+		}
+		var extra []string
+		for _, id := range leftoverIDs {
+			if !seen[id] {
+				extra = append(extra, id)
+			}
+		}
+		if lrefs, err := refsFor(ctx, extra); err == nil {
+			lbig, lsmall := split(lrefs)
+			for _, ref := range lbig {
+				handoff(ref)
+			}
+			for _, batch := range chunks(lsmall) {
+				batchFutures = append(batchFutures, startArchiveBatch(ctx, batch, q))
+			}
+		}
+	}
+
+	workflow.SetCurrentDetails(ctx, fmt.Sprintf("waiting for %d archive workflows and %d batches", len(children), len(batchFutures)))
 	for id, f := range children {
 		var ar ArchiveResult
 		if err := f.Get(ctx, &ar); err != nil {
+			if c := stopIfCancelled(ctx); c != nil {
+				return nil, c // the children are abandoned to finish on their own
+			}
 			if !alreadyRunning(err) {
-				res.Failures = append(res.Failures, id+": archive: "+err.Error())
+				res.fail(id + ": archive: " + err.Error())
 			}
 			continue
 		}
 		res.Archived += ar.Copies
 	}
-
-	res.SafeToFormat = len(src.Assets) > 0
-	for _, id := range src.Assets {
-		var archived bool
-		if err := workflow.ExecuteActivity(quick, acts.IsArchived, id).Get(ctx, &archived); err != nil || !archived {
-			res.SafeToFormat = false
-			break
+	for i, f := range batchFutures {
+		var br BatchResult
+		if err := f.Get(ctx, &br); err != nil {
+			if c := stopIfCancelled(ctx); c != nil {
+				return nil, c
+			}
+			res.fail(fmt.Sprintf("archive batch %d: %v", i+1, err))
+			continue
+		}
+		res.Archived += br.Archived
+		res.Failed += br.Failed
+		for _, m := range br.Failures {
+			if len(res.Failures) < maxListed {
+				res.Failures = append(res.Failures, m)
+			}
 		}
 	}
+
+	var safe bool
+	if scan.Assets > 0 {
+		if err := workflow.ExecuteActivity(quick, acts.AllArchivedOn, scan.Source).Get(ctx, &safe); err != nil {
+			safe = false
+		}
+	}
+	res.SafeToFormat = safe
 	workflow.SetCurrentDetails(ctx, fmt.Sprintf("%d assets, %d new, %d spooled, %d archived, %d failed; safe to format: %v",
-		res.Assets, res.New, res.Spooled, res.Archived, len(res.Failures), res.SafeToFormat))
+		res.Assets, res.New, res.Spooled, res.Archived, res.Failed, res.SafeToFormat))
 	return res, nil
+}
+
+func dedupe(ids []string) []string {
+	seen := map[string]bool{}
+	out := ids[:0:0]
+	for _, id := range ids {
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+func batchLabel(batch []ingest.AssetRef) string {
+	if len(batch) == 0 {
+		return "empty batch"
+	}
+	return fmt.Sprintf("%s +%d", batch[0].Path, len(batch)-1)
 }
 
 // startArchive starts (or joins) the ArchiveAsset workflow for an asset.
@@ -172,6 +363,24 @@ func startArchive(ctx workflow.Context, ref ingest.AssetRef, q Queues) workflow.
 		StaticDetails:         fmt.Sprintf("%s, asset %s", fmtBytes(ref.Size), ref.ID),
 	})
 	return workflow.ExecuteChildWorkflow(cctx, ArchiveAsset, ref, q)
+}
+
+// startArchiveBatch starts an ArchiveBatch child for a group of small
+// assets. Its ID carries the first path and the count; unlike a per-asset
+// archive it is not deduplicated, since each batch is a one-off grouping.
+func startArchiveBatch(ctx workflow.Context, batch []ingest.AssetRef, q Queues) workflow.ChildWorkflowFuture {
+	var total int64
+	for _, r := range batch {
+		total += r.Size
+	}
+	cctx := workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
+		WorkflowID:        "archive-batch:" + batchLabel(batch) + ":" + workflow.Now(ctx).UTC().Format("20060102T150405.000Z"),
+		TaskQueue:         q.Main,
+		ParentClosePolicy: enums.PARENT_CLOSE_POLICY_ABANDON,
+		StaticSummary:     batchLabel(batch),
+		StaticDetails:     fmt.Sprintf("%d files, %s", len(batch), fmtBytes(total)),
+	})
+	return workflow.ExecuteChildWorkflow(cctx, ArchiveBatch, batch, q)
 }
 
 // ArchiveResult is what ArchiveAsset returns: how many copies it made and
@@ -229,6 +438,55 @@ func ArchiveAsset(ctx workflow.Context, ref ingest.AssetRef, q Queues) (*Archive
 	return res, nil
 }
 
+// BatchResult is what ArchiveBatch returns.
+type BatchResult struct {
+	Files        int
+	Archived     int
+	Skipped      int
+	Failed       int
+	Failures     []string
+	Copied       int64
+	Duration     time.Duration
+	MiBPerSecond float64
+}
+
+// ArchiveBatch archives a group of small assets in one activity on the
+// NAS queue, holding one NAS slot for the whole group.
+func ArchiveBatch(ctx workflow.Context, batch []ingest.AssetRef, q Queues) (*BatchResult, error) {
+	var acts *Activities
+	opts := copyOpts
+	opts.TaskQueue = q.NAS
+	opts.Summary = batchLabel(batch)
+	workflow.SetCurrentDetails(ctx, fmt.Sprintf("archiving %d files", len(batch)))
+	var items []ingest.BatchItem
+	if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, opts), acts.ArchiveBatch, batch).Get(ctx, &items); err != nil {
+		workflow.SetCurrentDetails(ctx, "failed: "+err.Error())
+		return nil, err
+	}
+	res := &BatchResult{Files: len(batch)}
+	for _, it := range items {
+		switch {
+		case it.Err != "":
+			res.Failed++
+			if len(res.Failures) < maxListed {
+				res.Failures = append(res.Failures, it.Path+": "+it.Err)
+			}
+		case it.Skipped:
+			res.Skipped++
+		default:
+			res.Archived += it.Copies
+			res.Copied += it.Copied
+			res.Duration += it.Duration
+		}
+	}
+	if res.Duration > 0 {
+		res.MiBPerSecond = float64(res.Copied) / (1 << 20) / res.Duration.Seconds()
+	}
+	workflow.SetCurrentDetails(ctx, fmt.Sprintf("%d archived, %d already there, %d failed; %s at %.0f MiB/s",
+		res.Archived, res.Skipped, res.Failed, fmtBytes(res.Copied), res.MiBPerSecond))
+	return res, nil
+}
+
 // withSummary labels an activity with the file it works on.
 func withSummary(ctx workflow.Context, summary string) workflow.Context {
 	opts := workflow.GetActivityOptions(ctx)
@@ -255,34 +513,55 @@ func fmtBytes(n int64) string {
 type BacklogResult struct {
 	Assets       int
 	Archived     int
+	Failed       int
 	Failures     []string
 	Copied       int64
 	Duration     time.Duration
 	MiBPerSecond float64
 }
 
-// ArchiveBacklog hands every asset lacking a NAS copy to ArchiveAsset and
-// waits for them: `mm archive`.
+// ArchiveBacklog hands every asset lacking a NAS copy to ArchiveAsset or
+// an ArchiveBatch and waits for them: `mm archive`.
 func ArchiveBacklog(ctx workflow.Context, q Queues) (*BacklogResult, error) {
 	var acts *Activities
 	quick := workflow.WithActivityOptions(ctx, quickOpts)
-	var refs []ingest.AssetRef
-	if err := workflow.ExecuteActivity(quick, acts.NeedsArchive).Get(ctx, &refs); err != nil {
+	ids, err := pageIDs(ctx, func(offset, limit int) workflow.Future {
+		return workflow.ExecuteActivity(quick, acts.NeedsArchive, offset, limit)
+	})
+	if err != nil {
+		return nil, err
+	}
+	refs, err := refsFor(ctx, ids)
+	if err != nil {
 		return nil, err
 	}
 	res := &BacklogResult{Assets: len(refs)}
+	big, small := split(refs)
 	var total int64
 	futures := map[string]workflow.ChildWorkflowFuture{}
-	for _, ref := range refs {
+	for _, ref := range big {
 		futures[ref.ID] = startArchive(ctx, ref, q)
 		total += ref.Size
 	}
-	workflow.SetCurrentDetails(ctx, fmt.Sprintf("waiting for %d archive workflows, %s", len(futures), fmtBytes(total)))
+	var batches []workflow.ChildWorkflowFuture
+	for _, batch := range chunks(small) {
+		batches = append(batches, startArchiveBatch(ctx, batch, q))
+		for _, r := range batch {
+			total += r.Size
+		}
+	}
+	workflow.SetCurrentDetails(ctx, fmt.Sprintf("waiting for %d archive workflows and %d batches, %s", len(futures), len(batches), fmtBytes(total)))
 	for id, f := range futures {
 		var ar ArchiveResult
 		if err := f.Get(ctx, &ar); err != nil {
+			if c := stopIfCancelled(ctx); c != nil {
+				return nil, c
+			}
 			if !alreadyRunning(err) {
-				res.Failures = append(res.Failures, id+": "+err.Error())
+				res.Failed++
+				if len(res.Failures) < maxListed {
+					res.Failures = append(res.Failures, id+": "+err.Error())
+				}
 			}
 			continue
 		}
@@ -290,11 +569,33 @@ func ArchiveBacklog(ctx workflow.Context, q Queues) (*BacklogResult, error) {
 		res.Copied += ar.Copied
 		res.Duration += ar.Duration
 	}
+	for i, f := range batches {
+		var br BatchResult
+		if err := f.Get(ctx, &br); err != nil {
+			if c := stopIfCancelled(ctx); c != nil {
+				return nil, c
+			}
+			res.Failed++
+			if len(res.Failures) < maxListed {
+				res.Failures = append(res.Failures, fmt.Sprintf("batch %d: %v", i+1, err))
+			}
+			continue
+		}
+		res.Archived += br.Archived
+		res.Failed += br.Failed
+		res.Copied += br.Copied
+		res.Duration += br.Duration
+		for _, m := range br.Failures {
+			if len(res.Failures) < maxListed {
+				res.Failures = append(res.Failures, m)
+			}
+		}
+	}
 	if res.Duration > 0 {
 		res.MiBPerSecond = float64(res.Copied) / (1 << 20) / res.Duration.Seconds()
 	}
 	workflow.SetCurrentDetails(ctx, fmt.Sprintf("%d of %d archived, %d failed; %s at %.0f MiB/s per copy",
-		res.Archived, res.Assets, len(res.Failures), fmtBytes(res.Copied), res.MiBPerSecond))
+		res.Archived, res.Assets, res.Failed, fmtBytes(res.Copied), res.MiBPerSecond))
 	return res, nil
 }
 
@@ -308,6 +609,17 @@ func FlushSpool(ctx workflow.Context, spool string, opts ingest.FlushOptions) (i
 	fo.HeartbeatTimeout = 0
 	err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, fo), acts.Flush, spool, opts).Get(ctx, &rep)
 	return rep, err
+}
+
+// stopIfCancelled returns the workflow's cancellation, if any, so a loop
+// that tolerates per-asset failures still ends promptly and as cancelled
+// when the workflow itself is cancelled, rather than recording every
+// remaining asset as failed.
+func stopIfCancelled(ctx workflow.Context) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return nil
 }
 
 func isType(err error, typ string) bool {
@@ -328,15 +640,17 @@ type SpoolResult struct {
 	Assets       int
 	Spooled      int
 	Skipped      int
+	Failed       int
 	Failures     []string
 	Copied       int64
 	Duration     time.Duration
 	MiBPerSecond float64
 }
 
-// SpoolAssets brings assets back onto local storage from the NAS, all at
-// once on the NAS queue (whose worker bounds how many run together), and
-// optionally pins them first so a flush cannot undo the work: `mm spool`.
+// SpoolAssets brings assets back onto local storage from the NAS, on the
+// NAS queue (whose worker bounds how many run together), and optionally
+// pins them first so a flush cannot undo the work: `mm spool`. Large
+// files get an activity each, small ones a batch.
 func SpoolAssets(ctx workflow.Context, refs []ingest.AssetRef, pin bool, q Queues) (*SpoolResult, error) {
 	var acts *Activities
 	res := &SpoolResult{Assets: len(refs)}
@@ -351,19 +665,38 @@ func SpoolAssets(ctx workflow.Context, refs []ingest.AssetRef, pin bool, q Queue
 	}
 	opts := copyOpts
 	opts.TaskQueue = q.NAS
+	big, small := split(refs)
 	var total int64
-	futures := make([]workflow.Future, 0, len(refs))
-	for _, ref := range refs {
+	for _, r := range refs {
+		total += r.Size
+	}
+	workflow.SetCurrentDetails(ctx, fmt.Sprintf("spooling %d assets, %s", len(refs), fmtBytes(total)))
+	fail := func(msg string) {
+		res.Failed++
+		if len(res.Failures) < maxListed {
+			res.Failures = append(res.Failures, msg)
+		}
+	}
+	futures := make([]workflow.Future, 0, len(big))
+	for _, ref := range big {
 		o := opts
 		o.Summary = ref.Path
 		futures = append(futures, workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, o), acts.Spool, ref))
-		total += ref.Size
 	}
-	workflow.SetCurrentDetails(ctx, fmt.Sprintf("spooling %d assets, %s", len(refs), fmtBytes(total)))
+	batches := chunks(small)
+	bfutures := make([]workflow.Future, 0, len(batches))
+	for _, batch := range batches {
+		o := opts
+		o.Summary = batchLabel(batch)
+		bfutures = append(bfutures, workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, o), acts.SpoolBatch, batch))
+	}
 	for i, f := range futures {
 		var r ingest.CopyResult
 		if err := f.Get(ctx, &r); err != nil {
-			res.Failures = append(res.Failures, refs[i].Path+": "+err.Error())
+			if c := stopIfCancelled(ctx); c != nil {
+				return nil, c
+			}
+			fail(big[i].Path + ": " + err.Error())
 			continue
 		}
 		if r.Skipped {
@@ -374,13 +707,36 @@ func SpoolAssets(ctx workflow.Context, refs []ingest.AssetRef, pin bool, q Queue
 		res.Copied += r.Copied
 		res.Duration += r.Duration
 	}
+	for i, f := range bfutures {
+		var items []ingest.BatchItem
+		if err := f.Get(ctx, &items); err != nil {
+			if c := stopIfCancelled(ctx); c != nil {
+				return nil, c
+			}
+			fail(fmt.Sprintf("batch %d: %v", i+1, err))
+			continue
+		}
+		for _, it := range items {
+			switch {
+			case it.Err != "" || it.SpoolFull:
+				msg := it.Err
+				if it.SpoolFull {
+					msg = "no spool has room"
+				}
+				fail(it.Path + ": " + msg)
+			case it.Skipped:
+				res.Skipped++
+			default:
+				res.Spooled++
+				res.Copied += it.Copied
+				res.Duration += it.Duration
+			}
+		}
+	}
 	if res.Duration > 0 {
 		res.MiBPerSecond = float64(res.Copied) / (1 << 20) / res.Duration.Seconds()
 	}
 	workflow.SetCurrentDetails(ctx, fmt.Sprintf("%d spooled, %d already local, %d failed; %s at %.0f MiB/s per copy",
-		res.Spooled, res.Skipped, len(res.Failures), fmtBytes(res.Copied), res.MiBPerSecond))
+		res.Spooled, res.Skipped, res.Failed, fmtBytes(res.Copied), res.MiBPerSecond))
 	return res, nil
 }
-
-// SpoolWorkflowID names a spool-back run.
-func SpoolWorkflowID(tag string) string { return "spool:" + tag }
