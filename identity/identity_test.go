@@ -135,6 +135,21 @@ func TestSparseFileAndFullFile(t *testing.T) {
 	}
 }
 
+func TestFullFileProgress(t *testing.T) {
+	b := randBytes(t, 9*Chunk+123)
+	p := filepath.Join(t.TempDir(), "clip.braw")
+	os.WriteFile(p, b, 0o644)
+	var seen, calls int64
+	got, err := FullFileProgress(p, func(n int64) { seen += n; calls++ })
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(b)
+	if got != hex.EncodeToString(sum[:]) || seen != int64(len(b)) || calls < 3 {
+		t.Errorf("got %s seen %d calls %d", got, seen, calls)
+	}
+}
+
 func TestIDValid(t *testing.T) {
 	tests := []struct {
 		id   ID

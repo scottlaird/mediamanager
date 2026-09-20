@@ -96,6 +96,11 @@ type verifyResult struct {
 	start, end time.Time
 }
 
+// verifyProgress is shared by the readers: bytes read so far, updated as
+// files are hashed rather than when they finish, so the progress line
+// moves through a terabyte clip instead of jumping when it completes.
+type verifyProgress struct{ read atomic.Int64 }
+
 // Verify re-checks the mounted spool and NAS copies of the given assets
 // against the catalog. A copy that no longer matches is marked Mismatch:
 // it is then never linked to, never counts as a safe copy for flush, and
@@ -160,6 +165,7 @@ func (e *Env) Verify(ctx context.Context, refs []AssetRef, opts VerifyOptions) (
 	start := time.Now()
 	in := make(chan verifyJob)
 	out := make(chan verifyResult, par)
+	var vp verifyProgress
 	var wg sync.WaitGroup
 	for i := 0; i < par; i++ {
 		wg.Add(1)
@@ -167,11 +173,33 @@ func (e *Env) Verify(ctx context.Context, refs []AssetRef, opts VerifyOptions) (
 			defer wg.Done()
 			for j := range in {
 				t0 := time.Now()
-				it, ok := e.checkCopy(j.asset, j.copy, j.path, opts.Full)
+				var counted int64
+				it, ok := e.checkCopy(j.asset, j.copy, j.path, opts.Full, func(n int64) { counted += n; vp.read.Add(n) })
+				// Sparse checks and stats do not report through the
+				// callback; credit whatever the callback did not.
+				if expect := bytesToRead(j.asset, opts.Full); counted < expect {
+					vp.read.Add(expect - counted)
+				}
 				out <- verifyResult{job: j, item: it, ok: ok, read: bytesToRead(j.asset, opts.Full), start: t0, end: time.Now()}
 			}
 		}()
 	}
+	// Progress on a timer, from the shared counter, so a long file shows
+	// movement while it is being read.
+	prog := newProgress(e.Logf, "verify", 0)
+	tickDone := make(chan struct{})
+	go func() {
+		t := time.NewTicker(logEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-tickDone:
+				return
+			case <-t.C:
+				prog.report(vp.read.Load(), total)
+			}
+		}
+	}()
 	go func() {
 		defer close(in)
 		for _, j := range jobs {
@@ -185,14 +213,11 @@ func (e *Env) Verify(ctx context.Context, refs []AssetRef, opts VerifyOptions) (
 	go func() { wg.Wait(); close(out) }()
 
 	byAsset := map[string][]verifyResult{}
-	var done, read atomic.Int64
-	prog := newProgress(e.Logf, "verify", 0)
+	var read int64
 	perLoc := map[int64]*locAcc{}
 	for r := range out {
 		byAsset[r.job.asset.ID] = append(byAsset[r.job.asset.ID], r)
-		done.Add(1)
-		read.Add(r.read)
-		prog.report(read.Load(), total)
+		read += r.read
 		acc := perLoc[r.job.copy.LocationID]
 		if acc == nil {
 			acc = &locAcc{loc: r.job.copy.Location}
@@ -200,11 +225,13 @@ func (e *Env) Verify(ctx context.Context, refs []AssetRef, opts VerifyOptions) (
 		}
 		acc.add(r)
 	}
+	close(tickDone)
 	if err := ctx.Err(); err != nil {
 		return rep, err
 	}
 	rep.Duration = time.Since(start)
-	rep.BytesRead = read.Load()
+	rep.BytesRead = read
+	prog.report(read, total)
 	for _, p := range ps {
 		if acc := perLoc[p.cat.ID]; acc != nil {
 			rep.Locations = append(rep.Locations, acc.stats())
@@ -316,8 +343,10 @@ func bytesToRead(a catalog.Asset, full bool) int64 {
 	}
 }
 
-// checkCopy compares one file with the catalog. ok is true when it matches.
-func (e *Env) checkCopy(a catalog.Asset, cp catalog.Copy, path string, full bool) (VerifyItem, bool) {
+// checkCopy compares one file with the catalog. ok is true when it
+// matches. progress, if set, is told about bytes as a full hash reads
+// them.
+func (e *Env) checkCopy(a catalog.Asset, cp catalog.Copy, path string, full bool, progress func(int64)) (VerifyItem, bool) {
 	it := VerifyItem{Path: a.Kind.String() + "/" + a.RelPath, Location: cp.Location.Name}
 	st, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -349,7 +378,7 @@ func (e *Env) checkCopy(a catalog.Asset, cp catalog.Copy, path string, full bool
 			want = a.ID // stills: the ID is the original hash
 		}
 		if want != "" {
-			sum, err := identity.FullFile(path)
+			sum, err := identity.FullFileProgress(path, progress)
 			if err != nil {
 				it.Result, it.Detail = "missing", err.Error()
 				return it, false
