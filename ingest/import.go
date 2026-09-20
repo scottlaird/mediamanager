@@ -250,7 +250,7 @@ func (e *Env) ArchivePlan(ctx context.Context) ([]ArchiveItem, error) {
 		}
 		rel, relErr := e.treeRel(a)
 		for _, p := range ps {
-			if !p.mounted || p.cat.Kind != catalog.NAS || hasComplete(copies, p.cat.ID) {
+			if !p.mounted || p.cat.Kind != catalog.NAS || !p.cfg.Serves(a.Kind) || hasComplete(copies, p.cat.ID) {
 				continue
 			}
 			it.To = append(it.To, p.cat.Name)

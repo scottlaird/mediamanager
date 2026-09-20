@@ -251,7 +251,7 @@ func (e *Env) Spool(ctx context.Context, ps []place, assetID string) (CopyResult
 	var dest *place
 	for i := range ps {
 		p := &ps[i]
-		if !p.mounted || p.cat.Kind != catalog.Spool {
+		if !p.mounted || p.cat.Kind != catalog.Spool || !p.cfg.Serves(a.Kind) {
 			continue
 		}
 		free, err := freeSpace(p.root)
@@ -282,7 +282,7 @@ func (e *Env) Archive(ctx context.Context, ps []place, assetID string) ([]CopyRe
 	}
 	var results []CopyResult
 	for _, p := range ps {
-		if !p.mounted || p.cat.Kind != catalog.NAS {
+		if !p.mounted || p.cat.Kind != catalog.NAS || !p.cfg.Serves(a.Kind) {
 			continue
 		}
 		if hasComplete(copies, p.cat.ID) {

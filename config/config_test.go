@@ -163,6 +163,28 @@ func TestNASWhileImporting(t *testing.T) {
 	}
 }
 
+func TestLocationTrees(t *testing.T) {
+	base := "trees: {video: {link: /v}, still: {link: /s}}\n"
+	c, err := Parse([]byte(base + "locations: [{name: n, kind: nas, path: /n, trees: [video]}, {name: p, kind: nas, path: /p, trees: [still]}, {name: s, kind: spool, path: /s}]"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Locations[0].Serves(media.Video) || c.Locations[0].Serves(media.Still) || !c.Locations[2].Serves(media.Still) {
+		t.Error("Serves wrong")
+	}
+	for _, bad := range []string{
+		"locations: [{name: n, kind: nas, path: /n, trees: [movies]}]",
+		"locations: [{name: n, kind: nas, path: /n, trees: [audio]}]",
+		"locations: [{name: n, kind: nas, path: /n, trees: [video]}]", // still has no NAS
+		"locations: [{name: n, kind: nas, path: /n, tree: [video]}]",  // unknown key
+		"locations: [{name: n, kind: nas, path: /n}]\nconcurrency: {nas_while_importing: 1}",
+	} {
+		if _, err := Parse([]byte(base + bad)); err == nil {
+			t.Errorf("accepted %q", bad)
+		}
+	}
+}
+
 func TestDefaults(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", "/data")
 	t.Setenv("XDG_CONFIG_HOME", "/conf")

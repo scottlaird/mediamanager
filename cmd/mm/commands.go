@@ -114,17 +114,30 @@ func printPlan(w io.Writer, p *ingest.ImportPlan) {
 	}
 	fmt.Fprintln(w)
 	if p.Counts["new"] > 0 {
-		if p.Spool != "" {
-			fmt.Fprintf(w, "new files would spool to %s", p.Spool)
-		} else {
-			fmt.Fprint(w, p.SpoolNote)
+		kinds := map[string]bool{}
+		for _, it := range p.Items {
+			if it.Action == "new" {
+				kinds[it.Kind.String()] = true
+			}
 		}
-		if len(p.NAS) > 0 {
-			fmt.Fprintf(w, ", then archive to %s", strings.Join(p.NAS, ", "))
-		} else {
-			fmt.Fprint(w, "; no NAS is mounted")
+		for _, k := range []string{"video", "audio", "still"} {
+			r, ok := p.Routes[k]
+			if !ok || !kinds[k] {
+				continue
+			}
+			fmt.Fprintf(w, "new %s files would ", k)
+			if r.Spool != "" {
+				fmt.Fprintf(w, "spool to %s", r.Spool)
+			} else {
+				fmt.Fprint(w, "skip the spool (none mounted for this kind)")
+			}
+			if len(r.NAS) > 0 {
+				fmt.Fprintf(w, ", then archive to %s", strings.Join(r.NAS, ", "))
+			} else {
+				fmt.Fprint(w, "; no NAS is mounted for this kind")
+			}
+			fmt.Fprintln(w)
 		}
-		fmt.Fprintln(w)
 	}
 	if p.Counts["unrouted"] > 0 {
 		fmt.Fprintln(w, "unrouted kinds need a tree in the config; if one was just added, restart mm worker so it picks the config up")

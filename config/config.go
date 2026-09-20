@@ -8,8 +8,10 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -75,6 +77,23 @@ type Location struct {
 	// Priority orders spools for link resolution; lower wins. Ignored for
 	// the NAS.
 	Priority int `yaml:"priority"`
+	// Trees restricts the location to these kinds (video, audio, still).
+	// Empty means every configured tree, which is the usual case for a
+	// spool; a NAS that holds only photos lists just still.
+	Trees []string `yaml:"trees"`
+}
+
+// Serves reports whether the location holds the given kind's tree.
+func (l Location) Serves(k media.Kind) bool {
+	if len(l.Trees) == 0 {
+		return true
+	}
+	for _, t := range l.Trees {
+		if kindOf(t) == k {
+			return true
+		}
+	}
+	return false
 }
 
 // Extensions override the default per-kind extension lists.
@@ -134,7 +153,9 @@ func Load(path string) (*Config, error) {
 // Parse decodes YAML, fills defaults and validates.
 func Parse(b []byte) (*Config, error) {
 	var c Config
-	if err := yaml.Unmarshal(b, &c); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(b))
+	dec.KnownFields(true) // a misspelt or unsupported key is an error, not a silent no-op
+	if err := dec.Decode(&c); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("config: %w", err)
 	}
 	if err := c.finish(); err != nil {
@@ -230,6 +251,32 @@ func (c *Config) finish() error {
 		if l.VolumeUUID != "" && filepath.IsAbs(l.Path) {
 			return fmt.Errorf("location %q: path must be relative to the volume when volume_uuid is set", l.Name)
 		}
+		for _, t := range l.Trees {
+			if kindOf(t) == media.Unknown {
+				return fmt.Errorf("location %q: trees entry %q must be video, audio or still", l.Name, t)
+			}
+			if _, ok := c.Trees[t]; !ok {
+				return fmt.Errorf("location %q: no %s tree is configured", l.Name, t)
+			}
+		}
+	}
+	for name := range c.Trees {
+		k := kindOf(name)
+		var nas, spool bool
+		for _, l := range c.Locations {
+			if !l.Serves(k) {
+				continue
+			}
+			if l.Kind == "nas" {
+				nas = true
+			} else {
+				spool = true
+			}
+		}
+		if !nas {
+			return fmt.Errorf("tree %q: no nas location serves it", name)
+		}
+		_ = spool // a tree without a spool is allowed: it archives straight from the source
 	}
 	sort.SliceStable(c.Locations, func(i, j int) bool { return c.Locations[i].Priority < c.Locations[j].Priority })
 	return nil
