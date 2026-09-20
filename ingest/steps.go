@@ -103,6 +103,65 @@ func (e *Env) Reconcile(ctx context.Context, ps []place) (ReconcileReport, error
 	return rep, nil
 }
 
+// reconcileAsset points one asset's link, and its companions' links, at
+// their best mounted copies. It is what every copy step runs when it
+// finishes: cheap, no tree walk, no audit. Reconcile is the full pass.
+func (e *Env) reconcileAsset(ctx context.Context, ps []place, a catalog.Asset) error {
+	root, ok := e.linkRoot(a.Kind)
+	if !ok {
+		return nil
+	}
+	srcRoots, err := e.sourceRoots(ctx)
+	if err != nil {
+		return err
+	}
+	rootOf := e.rootOf(ps, srcRoots)
+	copies, err := e.Catalog.Copies(ctx, a.ID)
+	if err != nil {
+		return err
+	}
+	target, ok := linktree.Choose(copies, rootOf)
+	if !ok {
+		return nil // nothing usable mounted; leave the existing link alone
+	}
+	if _, err := linktree.Set(root, a.RelPath, target); err != nil {
+		return err
+	}
+	comps, err := e.Catalog.Companions(ctx, a.ID)
+	if err != nil {
+		return err
+	}
+	if len(comps) == 0 {
+		return nil
+	}
+	locByID := map[int64]catalog.Location{}
+	for _, cp := range copies {
+		locByID[cp.LocationID] = cp.Location
+	}
+	for _, c := range comps {
+		if _, ok := locByID[c.LocationID]; !ok {
+			if l, err := e.Catalog.LocationByID(ctx, c.LocationID); err == nil {
+				locByID[c.LocationID] = l
+			}
+		}
+	}
+	for key, t := range bestCompanions(comps, locByID, rootOf) {
+		if _, err := linktree.Set(root, companionPath(a.RelPath, key.role, key.ext), t); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// linkRoot is the link tree for a kind.
+func (e *Env) linkRoot(k media.Kind) (string, bool) {
+	t, ok := e.Config.Tree(k)
+	if !ok {
+		return "", false
+	}
+	return t.Link, true
+}
+
 // companionKey identifies one companion of an asset across locations.
 type companionKey struct {
 	role catalog.Role
@@ -207,6 +266,8 @@ func (e *Env) Spool(ctx context.Context, ps []place, assetID string) (CopyResult
 	if dest == nil {
 		return CopyResult{}, fmt.Errorf("%w: %s needs %d bytes", ErrSpoolFull, a.RelPath, a.Size)
 	}
+	e.spooling.Add(1)
+	defer e.spooling.Add(-1)
 	return e.copyTo(ctx, ps, a, copies, rootOf, *dest)
 }
 
@@ -231,13 +292,19 @@ func (e *Env) Archive(ctx context.Context, ps []place, assetID string) ([]CopyRe
 			results = append(results, CopyResult{AssetID: assetID, Location: p.cat.Name, Skipped: true, Proxies: n})
 			continue
 		}
+		release, err := e.archiveSlot(ctx, a.Size)
+		if err != nil {
+			return results, err
+		}
 		select {
 		case e.nas <- struct{}{}:
 		case <-ctx.Done():
+			release()
 			return results, ctx.Err()
 		}
 		r, err := e.copyTo(ctx, ps, a, copies, rootOf, p)
 		<-e.nas
+		release()
 		if err != nil {
 			return results, err
 		}
@@ -340,7 +407,7 @@ func (e *Env) copyTo(ctx context.Context, ps []place, a catalog.Asset, copies []
 		}
 	}
 	n := e.syncCompanions(ctx, a, rootOf, dest, false)
-	if _, err := e.Reconcile(ctx, ps); err != nil {
+	if err := e.reconcileAsset(ctx, ps, a); err != nil {
 		return CopyResult{}, err
 	}
 	return CopyResult{

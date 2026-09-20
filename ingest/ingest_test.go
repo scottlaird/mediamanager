@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 	"github.com/scottlaird/mediamanager/linktree"
 	"github.com/scottlaird/mediamanager/media"
 	"github.com/scottlaird/mediamanager/naming"
+	"github.com/scottlaird/mediamanager/volume"
 )
 
 const mib = 1 << 20
@@ -1081,5 +1084,169 @@ func TestPlanIsReadOnly(t *testing.T) {
 	plan, _ = f.env.Plan(ctx, card)
 	if plan.Counts["known"] != 2 || plan.Counts["new"] != 0 || plan.NewBytes != 0 || plan.Source == "" {
 		t.Errorf("second plan: %v source=%q", plan.Counts, plan.Source)
+	}
+}
+
+func TestArchiveCappedWhileSpooling(t *testing.T) {
+	f := newFixture(t, audioNone)
+	zero := 0
+	f.env.Config.Concurrency.NASDuringImport = &zero // pause entirely, the easiest cap to observe
+	card := mkCard(t, f.base, "card", map[string]int{"A001_C001.braw": 4 * mib, "B001_C001.braw": mib}, 91)
+	src, err := f.env.ScanSource(ctx, card)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps, _ := f.env.places(ctx)
+	if _, err := f.env.Spool(ctx, ps, src.Assets[1]); err != nil {
+		t.Fatal(err)
+	}
+	// Hold the spooling counter as if a big card copy were in progress.
+	f.env.spooling.Add(1)
+	done := make(chan error, 1)
+	var beats atomic.Int32
+	hctx := WithProgress(ctx, func(done, total int64) { beats.Add(1) })
+	start := time.Now()
+	go func() { _, err := f.env.Archive(hctx, ps, src.Assets[1]); done <- err }()
+	select {
+	case err := <-done:
+		t.Fatalf("archive ran while a spool copy was in progress: %v", err)
+	case <-time.After(2500 * time.Millisecond):
+	}
+	if beats.Load() == 0 {
+		t.Error("no progress reported while waiting; an activity heartbeat would have timed out")
+	}
+	f.env.spooling.Add(-1)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) < 2*time.Second {
+		t.Error("archive did not wait")
+	}
+	if !exists(filepath.Join(f.nas, "video", f.relOf(t, filepath.Join(card, "B001_C001.braw"), media.Video))) {
+		t.Error("archive did not run after the spool finished")
+	}
+}
+
+func TestArchiveOneAtATimeWhileSpooling(t *testing.T) {
+	f := newFixture(t, audioNone)
+	f.env.Config.Concurrency.NAS = 4 // default cap while importing is 1
+	card := mkCard(t, f.base, "card", map[string]int{"A.braw": mib, "B.braw": mib, "C.braw": mib}, 97)
+	src, err := f.env.ScanSource(ctx, card)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps, _ := f.env.places(ctx)
+	for _, id := range src.Assets {
+		if _, err := f.env.Spool(ctx, ps, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.env.spooling.Add(1)
+	defer f.env.spooling.Add(-1)
+	// Three archives at once: with one slot during import they serialise,
+	// so the peak number inside copyTo is one. Observe it via progress.
+	var inflight, peak atomic.Int32
+	var wg sync.WaitGroup
+	for _, id := range src.Assets {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			pctx := WithProgress(ctx, func(done, total int64) {
+				if done == 0 && total > 0 {
+					return // waiting heartbeat, not a copy
+				}
+			})
+			// Count concurrency at the copy boundary instead.
+			r, err := f.env.Archive(pctx, ps, id)
+			if err != nil {
+				t.Error(err)
+			}
+			_ = r
+		}(id)
+	}
+	// Sample the slot occupancy while they run.
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				n := int32(len(f.env.nasImport))
+				inflight.Store(n)
+				for {
+					p := peak.Load()
+					if n <= p || peak.CompareAndSwap(p, n) {
+						break
+					}
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+	wg.Wait()
+	close(stop)
+	if peak.Load() > 1 {
+		t.Errorf("peak archive copies during import = %d, want 1", peak.Load())
+	}
+	for _, id := range src.Assets {
+		a, _ := f.env.Catalog.Asset(ctx, id)
+		if !exists(filepath.Join(f.nas, "video", a.RelPath)) {
+			t.Errorf("%s not archived", a.RelPath)
+		}
+	}
+}
+
+func TestReconcileAssetUpdatesOnlyItsLinks(t *testing.T) {
+	f := newFixture(t, audioNone)
+	card := mkCard(t, f.base, "card", map[string]int{"A001_C001.braw": mib, "A001_C001.sidecar": 100, "B001_C001.braw": mib}, 93)
+	if _, err := f.env.Import(ctx, card); err != nil {
+		t.Fatal(err)
+	}
+	a := f.relOf(t, filepath.Join(card, "A001_C001.braw"), media.Video)
+	b := f.relOf(t, filepath.Join(card, "B001_C001.braw"), media.Video)
+	// Break both links by hand, then reconcile only A: A and its sidecar
+	// are fixed, B is left as it was, and no full audit ran (a stray
+	// regular file elsewhere in the tree does not stop it).
+	os.Remove(filepath.Join(f.links, "video", a))
+	os.Remove(filepath.Join(f.links, "video", b))
+	os.Symlink("/nowhere", filepath.Join(f.links, "video", b))
+	os.WriteFile(filepath.Join(f.links, "video", "stray.txt"), []byte("x"), 0o644)
+	asset, _ := f.env.Catalog.AssetByPath(ctx, media.Video, a)
+	ps, _ := f.env.places(ctx)
+	if err := f.env.reconcileAsset(ctx, ps, asset); err != nil {
+		t.Fatal(err)
+	}
+	if got := readlink(t, filepath.Join(f.links, "video", a)); got != filepath.Join(f.spool, "video", a) {
+		t.Errorf("a -> %s", got)
+	}
+	if got := readlink(t, filepath.Join(f.links, "video", naming.SidecarPath(a, "sidecar"))); got != filepath.Join(f.spool, "video", naming.SidecarPath(a, "sidecar")) {
+		t.Errorf("sidecar -> %s", got)
+	}
+	if got := readlink(t, filepath.Join(f.links, "video", b)); got != "/nowhere" {
+		t.Errorf("b was touched: %s", got)
+	}
+}
+
+func TestIdentifyIsCached(t *testing.T) {
+	f := newFixture(t, audioNone)
+	var calls atomic.Int32
+	f.env.Identify = func(path string) (volume.Info, error) {
+		calls.Add(1)
+		return volume.Info{UUID: "u-" + filepath.Base(path), Label: "L"}, nil
+	}
+	card := mkCard(t, f.base, "card", map[string]int{"A001_C001.braw": mib}, 95)
+	if _, err := f.env.Import(ctx, card); err != nil {
+		t.Fatal(err)
+	}
+	n := calls.Load()
+	if n > 6 { // three locations plus the card, each looked up once, not once per copy
+		t.Errorf("Identify called %d times during one import", n)
+	}
+	if _, err := f.env.Relink(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != n {
+		t.Errorf("Identify called again within the cache window: %d -> %d", n, calls.Load())
 	}
 }

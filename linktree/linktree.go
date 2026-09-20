@@ -141,6 +141,32 @@ func Reconcile(root string, want map[string]string, opts Options) (Report, error
 	return rep, nil
 }
 
+// Set makes the single link at root/rel point at target (absolute),
+// creating directories as needed, without walking the tree. It is what a
+// copy step uses to update just the asset it touched; Reconcile remains
+// the full pass. A regular file or directory at the link's path is an
+// error. It reports whether anything changed.
+func Set(root, rel, target string) (changed bool, err error) {
+	if !filepath.IsAbs(target) {
+		return false, fmt.Errorf("linktree: target for %s is not absolute: %s", rel, target)
+	}
+	link := filepath.Join(root, filepath.FromSlash(rel))
+	have, err := os.Readlink(link)
+	switch {
+	case err == nil && have == target:
+		return false, nil
+	case err == nil:
+		return true, swap(link, target)
+	case errors.Is(err, fs.ErrNotExist):
+		if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+			return false, err
+		}
+		return true, swap(link, target)
+	default:
+		return false, fmt.Errorf("linktree: %s exists and is not a symlink; refusing to replace it", link)
+	}
+}
+
 // swap installs a symlink at link via a temporary name and rename, so link
 // always resolves to either the old target or the new one.
 func swap(link, target string) error {

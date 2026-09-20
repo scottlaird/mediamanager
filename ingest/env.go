@@ -41,13 +41,87 @@ type Env struct {
 	loc        *time.Location
 	classifier *scan.Classifier
 
-	mu   sync.Mutex // serialises reconcile and location resolution
-	nas  chan struct{}
-	once sync.Once
+	mu  sync.Mutex // serialises reconcile and location resolution
+	nas chan struct{}
+	// nasImport bounds archive copies while spooling; nil means none.
+	nasImport chan struct{}
+	once      sync.Once
 
 	assetMu sync.Mutex
 	assets  map[string]*sync.Mutex
 	copySeq atomic.Int64
+
+	// spooling counts spool copies in progress in this process; archive
+	// copies are capped while it is non-zero.
+	spooling atomic.Int32
+
+	identMu    sync.Mutex
+	identCache map[string]identEntry
+}
+
+type identEntry struct {
+	info volume.Info
+	err  error
+	at   time.Time
+}
+
+// identifyTTL bounds how long a volume lookup is reused. Identify shells
+// out to diskutil on macOS, which is far too slow to run per copy.
+const identifyTTL = 30 * time.Second
+
+// identify is Identify with a short cache.
+func (e *Env) identify(path string) (volume.Info, error) {
+	if e.Identify == nil {
+		return volume.Info{}, errors.New("no identify")
+	}
+	e.identMu.Lock()
+	defer e.identMu.Unlock()
+	if ent, ok := e.identCache[path]; ok && time.Since(ent.at) < identifyTTL {
+		return ent.info, ent.err
+	}
+	if e.identCache == nil {
+		e.identCache = map[string]identEntry{}
+	}
+	info, err := e.Identify(path)
+	e.identCache[path] = identEntry{info, err, time.Now()}
+	return info, err
+}
+
+// archiveSlot admits one archive copy under the import-time cap: while
+// spool copies are running in this process, at most NASWhileImporting
+// archive copies proceed (none, if it is 0). The wait keeps the caller's
+// progress callback, and so any activity heartbeat, alive. The returned
+// func releases the slot.
+func (e *Env) archiveSlot(ctx context.Context, total int64) (release func(), err error) {
+	e.init()
+	report := progressFrom(ctx)
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	logged := false
+	for {
+		if e.spooling.Load() == 0 {
+			return func() {}, nil
+		}
+		if e.nasImport != nil {
+			select {
+			case e.nasImport <- struct{}{}:
+				return func() { <-e.nasImport }, nil
+			default:
+			}
+		}
+		if !logged {
+			e.logf("archive waiting: %d spool copies in progress, %d archive copies allowed meanwhile", e.spooling.Load(), cap(e.nasImport))
+			logged = true
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-t.C:
+			if report != nil {
+				report(0, total)
+			}
+		}
+	}
 }
 
 // lockAsset serialises tier transitions of one asset, so two concurrent
@@ -79,6 +153,9 @@ func (e *Env) init() {
 			n = 1
 		}
 		e.nas = make(chan struct{}, n)
+		if k := e.Config.Concurrency.NASWhileImporting(); k > 0 {
+			e.nasImport = make(chan struct{}, k)
+		}
 	})
 }
 
@@ -117,7 +194,7 @@ func (e *Env) places(ctx context.Context) ([]place, error) {
 		}
 		cat := catalog.Location{Kind: catalog.LocationKind(l.Kind), Name: l.Name, VolumeUUID: l.VolumeUUID, Priority: l.Priority, Root: p.root}
 		if p.mounted && cat.VolumeUUID == "" && e.Identify != nil {
-			if info, err := e.Identify(p.root); err == nil {
+			if info, err := e.identify(p.root); err == nil {
 				cat.VolumeUUID, cat.Label = info.UUID, info.Label
 			}
 		}
