@@ -1472,3 +1472,66 @@ func TestLocAccWallIsUnionOfIntervals(t *testing.T) {
 		t.Errorf("rate = %.3f, want 0.75", got)
 	}
 }
+
+func TestVerifyFullWithoutReferenceHash(t *testing.T) {
+	f := newFixture(t, audioNone)
+	card := mkCard(t, f.base, "card", map[string]int{"A001_C001.braw": 3 * mib}, 121)
+	if _, err := f.env.Import(ctx, card); err != nil {
+		t.Fatal(err)
+	}
+	clip := f.relOf(t, filepath.Join(card, "A001_C001.braw"), media.Video)
+	a := mustAsset(t, f, media.Video, clip)
+	// Pretend the asset was adopted or resumed: no full hash on record.
+	if err := f.env.Catalog.SetFullSHA256(ctx, a.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	refs := []AssetRef{RefOf(a)}
+
+	// Both copies agree: everything is read, the hash is recorded.
+	rep, err := f.env.Verify(ctx, refs, VerifyOptions{Full: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.OK != 2 || rep.Mismatch != 0 || rep.BytesRead != 2*3*mib {
+		t.Fatalf("agreeing copies: %+v", rep)
+	}
+	if len(rep.Items) != 1 || rep.Items[0].Result != "recorded" {
+		t.Errorf("items = %+v", rep.Items)
+	}
+	a = mustAsset(t, f, media.Video, clip)
+	want, _ := identity.FullFile(filepath.Join(card, "A001_C001.braw"))
+	if a.FullSHA256 != want {
+		t.Errorf("recorded hash %q, want %q", a.FullSHA256, want)
+	}
+	// With the reference now in place, a corrupted middle byte on the NAS
+	// (invisible to the sparse check) is caught.
+	nasClip := filepath.Join(f.nas, "video", clip)
+	b, _ := os.ReadFile(nasClip)
+	b[len(b)/2] ^= 0xff
+	os.WriteFile(nasClip, b, 0o644)
+	rep, _ = f.env.Verify(ctx, refs, VerifyOptions{Full: true})
+	if rep.Mismatch != 1 || rep.Items[0].Result != "hash" || rep.Items[0].Location != "nas" {
+		t.Errorf("middle corruption: %+v", rep)
+	}
+
+	// No reference and the copies disagree: reported as a conflict on
+	// each, nothing recorded, nothing marked as the bad one.
+	f.env.Catalog.SetFullSHA256(ctx, a.ID, "")
+	f.env.Catalog.SetCopyState(ctx, a.ID, mustLoc(t, f, "nas").ID, catalog.Complete)
+	rep, _ = f.env.Verify(ctx, refs, VerifyOptions{Full: true})
+	if rep.Mismatch != 2 || len(rep.Items) != 2 || rep.Items[0].Result != "conflict" {
+		t.Errorf("disagreeing copies: %+v", rep)
+	}
+	if got := mustAsset(t, f, media.Video, clip).FullSHA256; got != "" {
+		t.Errorf("hash recorded despite conflict: %s", got)
+	}
+}
+
+func mustLoc(t *testing.T, f *fixture, name string) catalog.Location {
+	t.Helper()
+	l, err := f.env.Catalog.LocationByName(ctx, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return l
+}
