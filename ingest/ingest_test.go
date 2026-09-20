@@ -1020,6 +1020,50 @@ func TestGeneratedProxyInLinkTreeIsSwept(t *testing.T) {
 	}
 }
 
+func TestLocationsScopedToTrees(t *testing.T) {
+	f := newFixture(t, audioNone)
+	// A second NAS that serves only stills, and the first one restricted
+	// to video; the spool serves everything.
+	photos := filepath.Join(f.base, "photos")
+	os.MkdirAll(photos, 0o755)
+	f.env.Config.Locations = append(f.env.Config.Locations, config.Location{Name: "nas-photos", Kind: "nas", Path: photos, Trees: []string{"still"}})
+	for i := range f.env.Config.Locations {
+		if f.env.Config.Locations[i].Name == "nas" {
+			f.env.Config.Locations[i].Trees = []string{"video"}
+		}
+	}
+	card := mkCard(t, f.base, "card", map[string]int{"A001_C001.braw": mib, "L1004821.DNG": 4096}, 101)
+	sum, err := f.env.Import(ctx, card)
+	if err != nil || len(sum.Failures) != 0 || !sum.SafeToFormat {
+		t.Fatalf("import: %+v, %v", sum, err)
+	}
+	clip := f.relOf(t, filepath.Join(card, "A001_C001.braw"), media.Video)
+	if !exists(filepath.Join(f.nas, "video", clip)) || exists(filepath.Join(photos, "video", clip)) {
+		t.Error("video went to the wrong NAS")
+	}
+	if !exists(filepath.Join(photos, "stills", "2026/09/05/l1004821.dng")) || exists(filepath.Join(f.nas, "stills", "2026/09/05/l1004821.dng")) {
+		t.Error("still went to the wrong NAS")
+	}
+	still, _ := f.env.Catalog.AssetByPath(ctx, media.Still, "2026/09/05/l1004821.dng")
+	st, _ := f.env.List(ctx, ListOptions{Kind: media.Still})
+	if len(st) != 1 || !equalStrings(st[0].Copies, []string{"fast", "nas-photos", st[0].Copies[2]}) {
+		t.Errorf("still copies = %v", st[0].Copies)
+	}
+	_ = still
+	// Flush treats the photo NAS as the archive for stills.
+	rep, err := f.env.FlushSpool(ctx, "fast", FlushOptions{})
+	if err != nil || len(rep.Flushed) != 2 {
+		t.Errorf("flush: %+v, %v", rep, err)
+	}
+	if got := readlink(t, filepath.Join(f.links, "still", "2026/09/05/l1004821.dng")); got != filepath.Join(photos, "stills", "2026/09/05/l1004821.dng") {
+		t.Errorf("still link -> %s", got)
+	}
+	plan, _ := f.env.Plan(ctx, card)
+	if r := plan.Routes["still"]; len(r.NAS) != 1 || r.NAS[0] != "nas-photos" {
+		t.Errorf("still route = %+v", r)
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
@@ -1052,7 +1096,7 @@ func TestPlanIsReadOnly(t *testing.T) {
 			t.Errorf("%s = %d, want %d (%v)", op, plan.Counts[op], n, plan.Counts)
 		}
 	}
-	if plan.Spool != "fast" || len(plan.NAS) != 1 || plan.NewBytes != 50*1024+mib || plan.Shape != "dcim" {
+	if r := plan.Routes["video"]; r.Spool != "fast" || len(r.NAS) != 1 || plan.NewBytes != 50*1024+mib || plan.Shape != "dcim" {
 		t.Errorf("plan = %+v", plan)
 	}
 	for _, it := range plan.Items {

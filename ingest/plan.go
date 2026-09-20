@@ -45,11 +45,16 @@ type ImportPlan struct {
 	Counts map[string]int
 	// NewBytes is the size of everything that would be copied.
 	NewBytes int64
-	// Spool names the spool a new asset would be copied to first, or is
-	// empty with SpoolNote saying why not.
-	Spool     string
-	SpoolNote string
-	NAS       []string
+	// Routes says, per kind with a tree, which spool a new file would be
+	// copied to first (empty: none mounted, so it would be archived
+	// straight from the source) and which NAS locations would receive it.
+	Routes map[string]Route
+}
+
+// Route is where one kind's new files go.
+type Route struct {
+	Spool string
+	NAS   []string
 }
 
 // Plan reports what Import would do with a source without doing any of
@@ -79,21 +84,26 @@ func (e *Env) Plan(ctx context.Context, root string) (*ImportPlan, error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, p := range ps {
-		if !p.mounted {
+	plan.Routes = map[string]Route{}
+	for _, k := range allKinds {
+		if _, ok := e.Config.Tree(k); !ok {
 			continue
 		}
-		switch p.cat.Kind {
-		case catalog.Spool:
-			if plan.Spool == "" {
-				plan.Spool = p.cat.Name
+		var r Route
+		for _, p := range ps {
+			if !p.mounted || !p.cfg.Serves(k) {
+				continue
 			}
-		case catalog.NAS:
-			plan.NAS = append(plan.NAS, p.cat.Name)
+			switch p.cat.Kind {
+			case catalog.Spool:
+				if r.Spool == "" {
+					r.Spool = p.cat.Name
+				}
+			case catalog.NAS:
+				r.NAS = append(r.NAS, p.cat.Name)
+			}
 		}
-	}
-	if plan.Spool == "" {
-		plan.SpoolNote = "no spool is mounted; new assets would be archived straight from the source"
+		plan.Routes[k.String()] = r
 	}
 
 	byKey := map[string]bool{} // originals present, for companion pairing
