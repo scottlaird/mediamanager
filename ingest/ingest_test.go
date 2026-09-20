@@ -1323,3 +1323,120 @@ func TestIdentifyIsCached(t *testing.T) {
 		t.Errorf("Identify called again within the cache window: %d -> %d", n, calls.Load())
 	}
 }
+
+func TestVerify(t *testing.T) {
+	f := newFixture(t, audioNone)
+	card := mkCard(t, f.base, "card", map[string]int{"A001_C001.braw": 3 * mib, "L1004821.DNG": 200 * 1024, "L1004822.DNG": 100 * 1024}, 111)
+	if _, err := f.env.Import(ctx, card); err != nil {
+		t.Fatal(err)
+	}
+	all, _ := f.env.List(ctx, ListOptions{})
+	var refs []AssetRef
+	for _, a := range all {
+		refs = append(refs, RefOf(a.Asset))
+	}
+	clip := f.relOf(t, filepath.Join(card, "A001_C001.braw"), media.Video)
+
+	// Everything intact: 3 assets x 2 mounted copies (spool, nas).
+	rep, err := f.env.Verify(ctx, refs, VerifyOptions{Full: true})
+	if err != nil || rep.Copies != 6 || rep.OK != 6 || len(rep.Items) != 0 {
+		t.Fatalf("clean verify: %+v, %v", rep, err)
+	}
+
+	// A raw editor rewrites the NAS copy of one still; the NAS copy of the
+	// clip gets truncated; the spool copy of the other still vanishes.
+	nasStill := filepath.Join(f.nas, "stills", "2026/09/05/l1004821.dng")
+	edited := bytes.Repeat([]byte("edited"), 40000)
+	os.WriteFile(nasStill, edited, 0o644)
+	nasClip := filepath.Join(f.nas, "video", clip)
+	b, _ := os.ReadFile(nasClip)
+	os.WriteFile(nasClip, b[:len(b)-100], 0o644)
+	os.Remove(filepath.Join(f.spool, "stills", "2026/09/05/l1004822.dng"))
+
+	rep, err = f.env.Verify(ctx, refs, VerifyOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Mismatch != 2 || rep.Missing != 1 || rep.OK != 3 || rep.Updated != 0 {
+		t.Fatalf("verify after damage: %+v", rep)
+	}
+	kinds := map[string]string{}
+	for _, it := range rep.Items {
+		kinds[it.Location+" "+it.Path] = it.Result
+	}
+	if kinds["nas still/2026/09/05/l1004821.dng"] != "size" || kinds["nas video/"+clip] != "size" || kinds["fast still/2026/09/05/l1004822.dng"] != "missing" {
+		t.Errorf("items = %v", kinds)
+	}
+	// Mismatched copies are out of the running: the clip's link stays on
+	// the intact spool copy, and flush refuses to delete it.
+	if got := readlink(t, filepath.Join(f.links, "video", clip)); got != filepath.Join(f.spool, "video", clip) {
+		t.Errorf("clip link -> %s", got)
+	}
+	fr, _ := f.env.FlushSpool(ctx, "fast", FlushOptions{})
+	for _, id := range fr.Flushed {
+		a, _ := f.env.Catalog.Asset(ctx, id)
+		if a.RelPath == clip || a.RelPath == "2026/09/05/l1004821.dng" {
+			t.Errorf("flushed %s despite a mismatched NAS copy", a.RelPath)
+		}
+	}
+	// Nothing on disk was changed by a report-only verify.
+	if got, _ := os.ReadFile(nasStill); !bytes.Equal(got, edited) {
+		t.Error("report-only verify changed the edited file")
+	}
+
+	// --allow-updates: the still is adopted and its spool copy replaced;
+	// the clip is reported as unresolved and left alone.
+	rep, err = f.env.Verify(ctx, refs, VerifyOptions{AllowUpdates: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Updated != 1 {
+		t.Fatalf("allow-updates: %+v", rep)
+	}
+	still, _ := f.env.Catalog.AssetByPath(ctx, media.Still, "2026/09/05/l1004821.dng")
+	if still.Size != int64(len(edited)) || still.FullSHA256 == still.ID {
+		t.Errorf("asset not updated: %+v", still)
+	}
+	if got, _ := os.ReadFile(filepath.Join(f.spool, "stills", "2026/09/05/l1004821.dng")); !bytes.Equal(got, edited) {
+		t.Error("spool copy not replaced with the edited content")
+	}
+	var unresolved bool
+	for _, it := range rep.Items {
+		if it.Result == "unresolved" && it.Path == "video/"+clip {
+			unresolved = true
+		}
+	}
+	if !unresolved {
+		t.Errorf("clip not reported unresolved: %+v", rep.Items)
+	}
+	if got, _ := os.ReadFile(nasClip); len(got) != len(b)-100 {
+		t.Error("clip was modified by allow-updates")
+	}
+	// A clean re-verify of the still passes now; the clip's NAS copy is
+	// still mismatched until restored by hand.
+	rep, _ = f.env.Verify(ctx, refs, VerifyOptions{Full: true})
+	if rep.Mismatch != 1 || rep.Missing != 1 {
+		t.Errorf("re-verify: %+v", rep)
+	}
+	// Restore the clip by hand and verify again: back to complete.
+	os.WriteFile(nasClip, b, 0o644)
+	rep, _ = f.env.Verify(ctx, []AssetRef{RefOf(mustAsset(t, f, media.Video, clip))}, VerifyOptions{})
+	if rep.Mismatch != 0 || rep.OK != 2 {
+		t.Errorf("after restore: %+v", rep)
+	}
+	cps, _ := f.env.Catalog.Copies(ctx, mustAsset(t, f, media.Video, clip).ID)
+	for _, cp := range cps {
+		if cp.Location.Kind == catalog.NAS && cp.State != catalog.Complete {
+			t.Errorf("NAS copy still %s after restore", cp.State)
+		}
+	}
+}
+
+func mustAsset(t *testing.T, f *fixture, kind media.Kind, rel string) catalog.Asset {
+	t.Helper()
+	a, err := f.env.Catalog.AssetByPath(ctx, kind, rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
+}

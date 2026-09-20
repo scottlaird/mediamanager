@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS copies (
     asset_id    TEXT    NOT NULL REFERENCES assets(id),
     location_id INTEGER NOT NULL REFERENCES locations(id),
     relpath     TEXT    NOT NULL,
-    state       TEXT    NOT NULL CHECK (state IN ('partial', 'complete')),
+    state       TEXT    NOT NULL CHECK (state IN ('partial', 'complete', 'mismatch')),
     verified_at TEXT    NOT NULL DEFAULT '',
     full_sha256 TEXT    NOT NULL DEFAULT '',
     PRIMARY KEY (asset_id, location_id)
