@@ -116,12 +116,36 @@ func Full(r io.Reader) (string, error) {
 
 // FullFile returns the hex SHA-256 of the file at path.
 func FullFile(path string) (string, error) {
+	return FullFileProgress(path, nil)
+}
+
+// FullFileProgress is FullFile with a callback for each chunk read, given
+// the chunk's size, so a caller can show progress through a large file.
+func FullFileProgress(path string, progress func(n int64)) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
-	return Full(f)
+	if progress == nil {
+		return Full(f)
+	}
+	h := sha256.New()
+	buf := make([]byte, 4<<20)
+	for {
+		n, err := f.Read(buf)
+		if n > 0 {
+			h.Write(buf[:n])
+			progress(int64(n))
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // NewFullHasher returns a hash suitable for computing a Full identity
