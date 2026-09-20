@@ -19,7 +19,7 @@ import (
 )
 
 func importCmd() *cobra.Command {
-	var detach bool
+	var detach, dryRun bool
 	cmd := &cobra.Command{
 		Use:   "import <source>...",
 		Short: "Register, link, spool and archive everything on one or more sources",
@@ -34,6 +34,16 @@ at a time per source. Re-running on the same source is safe and cheap.`,
 				return err
 			}
 			defer done()
+			if dryRun {
+				for _, src := range args {
+					plan, err := env.Plan(cmd.Context(), src)
+					if err != nil {
+						return err
+					}
+					printPlan(os.Stdout, plan)
+				}
+				return nil
+			}
 			if c, q, ok, err := temporalClient(env); err != nil {
 				return err
 			} else if ok {
@@ -70,9 +80,55 @@ at a time per source. Re-running on the same source is safe and cheap.`,
 			return nil
 		},
 	}
+	cmd.Flags().BoolVarP(&dryRun, "dry-run", "n", false, "show what would be imported and where, without computing identities or writing anything")
 	cmd.Flags().BoolVar(&detach, "detach", false, "with Temporal: start the workflows and return without waiting")
 	cmd.Flags().BoolVar(&local, "local", false, "run in-process even if temporal is configured")
 	return cmd
+}
+
+func printPlan(w io.Writer, p *ingest.ImportPlan) {
+	fmt.Fprintf(w, "%s (%s)", p.Root, p.Shape)
+	if p.Source != "" {
+		fmt.Fprintf(w, ", seen before as %s", p.Source)
+	}
+	fmt.Fprintln(w)
+	tw := tabwriter.NewWriter(w, 2, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "ACTION\tSIZE\tFILE\tDESTINATION\tNOTE")
+	for _, it := range p.Items {
+		size := ""
+		if it.Size > 0 {
+			size = humanSize(it.Size)
+		}
+		note := it.Note
+		if it.Action == "new" && it.TimeSource != "" {
+			note = "date from " + it.TimeSource
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", it.Action, size, it.Rel, it.Dest, note)
+	}
+	tw.Flush()
+	fmt.Fprintf(w, "\n%d new (%s)", p.Counts["new"], humanSize(p.NewBytes))
+	for _, op := range []string{"known", "companion", "orphan", "unrouted", "unrecognised"} {
+		if n := p.Counts[op]; n > 0 {
+			fmt.Fprintf(w, ", %d %s", n, op)
+		}
+	}
+	fmt.Fprintln(w)
+	if p.Counts["new"] > 0 {
+		if p.Spool != "" {
+			fmt.Fprintf(w, "new files would spool to %s", p.Spool)
+		} else {
+			fmt.Fprint(w, p.SpoolNote)
+		}
+		if len(p.NAS) > 0 {
+			fmt.Fprintf(w, ", then archive to %s", strings.Join(p.NAS, ", "))
+		} else {
+			fmt.Fprint(w, "; no NAS is mounted")
+		}
+		fmt.Fprintln(w)
+	}
+	if p.Counts["unrouted"] > 0 {
+		fmt.Fprintln(w, "unrouted kinds need a tree in the config; if one was just added, restart mm worker so it picks the config up")
+	}
 }
 
 func printSummary(w io.Writer, src string, s *ingest.Summary) {
@@ -80,6 +136,9 @@ func printSummary(w io.Writer, src string, s *ingest.Summary) {
 		src, s.Source.Shape, len(s.Source.Assets), len(s.Source.New), s.Spooled, s.Archived)
 	for _, rel := range s.Source.Unrouted {
 		fmt.Fprintf(w, "  skipped (no tree for its kind): %s\n", rel)
+	}
+	if len(s.Source.Unrouted) > 0 {
+		fmt.Fprintf(w, "  (a tree added to the config takes effect for Temporal imports only after mm worker is restarted)\n")
 	}
 	for _, rel := range s.Source.Orphans {
 		fmt.Fprintf(w, "  proxy or sidecar without an original: %s\n", rel)

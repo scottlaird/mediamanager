@@ -1028,3 +1028,58 @@ func equalStrings(a, b []string) bool {
 	}
 	return true
 }
+
+func TestPlanIsReadOnly(t *testing.T) {
+	f := newFixture(t, audioNone)
+	card := mkCard(t, f.base, "card", map[string]int{
+		"DCIM/100_PANA/P1000001.RW2":     50 * 1024,
+		"DCIM/100_PANA/P1000001.XMP":     300,
+		"DCIM/100_PANA/P1000002.MP4":     mib,
+		"DCIM/100_PANA/ZOOM0001.WAV":     4096, // no audio tree: unrouted
+		"DCIM/100_PANA/notes.txt":        10,
+		"DCIM/100_PANA/Proxy/LONELY.mp4": 512,
+	}, 81)
+	plan, err := f.env.Plan(ctx, card)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int{"new": 2, "companion": 1, "unrouted": 1, "unrecognised": 1, "orphan": 1}
+	for op, n := range want {
+		if plan.Counts[op] != n {
+			t.Errorf("%s = %d, want %d (%v)", op, plan.Counts[op], n, plan.Counts)
+		}
+	}
+	if plan.Spool != "fast" || len(plan.NAS) != 1 || plan.NewBytes != 50*1024+mib || plan.Shape != "dcim" {
+		t.Errorf("plan = %+v", plan)
+	}
+	for _, it := range plan.Items {
+		switch it.Rel {
+		case "DCIM/100_PANA/P1000002.MP4":
+			if it.Dest != "video/2026/09/05/p1000002-<id>.mp4" || it.TimeSource == "" {
+				t.Errorf("mp4 item %+v", it)
+			}
+		case "DCIM/100_PANA/P1000001.RW2":
+			if it.Dest != "stills/2026/09/05/p1000001.rw2" {
+				t.Errorf("rw2 item %+v", it)
+			}
+		}
+	}
+	// Nothing was written anywhere.
+	if st, _ := f.env.Status(ctx); len(st.Assets) != 0 {
+		t.Errorf("plan registered %d assets", len(st.Assets))
+	}
+	if entries, _ := os.ReadDir(f.spool); len(entries) != 0 {
+		t.Error("plan wrote to the spool")
+	}
+	if exists(f.links) {
+		t.Error("plan created the link tree")
+	}
+	// After a real import the same card reads as known.
+	if _, err := f.env.Import(ctx, card); err != nil {
+		t.Fatal(err)
+	}
+	plan, _ = f.env.Plan(ctx, card)
+	if plan.Counts["known"] != 2 || plan.Counts["new"] != 0 || plan.NewBytes != 0 || plan.Source == "" {
+		t.Errorf("second plan: %v source=%q", plan.Counts, plan.Source)
+	}
+}

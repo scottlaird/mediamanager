@@ -107,6 +107,9 @@ func printImportResult(w *os.File, src string, r *mmtemporal.ImportResult) {
 	for _, rel := range r.Unrouted {
 		fmt.Fprintf(w, "  skipped (no tree for its kind): %s\n", rel)
 	}
+	if len(r.Unrouted) > 0 {
+		fmt.Fprintf(w, "  (a tree added to the config takes effect only after mm worker is restarted)\n")
+	}
 	for _, rel := range r.Orphans {
 		fmt.Fprintf(w, "  proxy or sidecar without an original: %s\n", rel)
 	}
