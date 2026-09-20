@@ -197,6 +197,16 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+func TestPhosBase(t *testing.T) {
+	f := File{Rel: "DCIM/109HASBL/B0002567.3FR.phos", Ext: "phos", Role: Sidecar}
+	if f.Base() != "B0002567" {
+		t.Errorf("Base = %q", f.Base())
+	}
+	if kind, ext := DefaultClassifier().Classify("B0002567.3FR.phos"); kind != media.Unknown || ext != "phos" || roleOf("x/B0002567.3FR.phos", kind, ext) != Sidecar {
+		t.Errorf("phos classified as %v %q", kind, ext)
+	}
+}
+
 func TestIsJunk(t *testing.T) {
 	for name, want := range map[string]bool{
 		".DS_Store": true, "._clip.braw": true, ".Spotlight-V100": true, ".Trashes": true,

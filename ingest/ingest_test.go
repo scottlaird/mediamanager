@@ -1064,6 +1064,35 @@ func TestLocationsScopedToTrees(t *testing.T) {
 	}
 }
 
+func TestPhocusSidecarIsSwept(t *testing.T) {
+	f := newFixture(t, audioNone)
+	card := mkCard(t, f.base, "card", map[string]int{"DCIM/109HASBL/B0002567.3FR": 300 * 1024, "DCIM/109HASBL/B0002567.HEIC": 50 * 1024}, 103)
+	if _, err := f.env.Import(ctx, card); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(f.links, "still", "2026/09/05/b0002567.3fr.phos")
+	os.WriteFile(link, []byte("phocus settings"), 0o644)
+	if _, err := f.env.Relink(ctx); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(f.spool, "stills", "2026/09/05/b0002567.3fr.phos")
+	if !exists(want) {
+		t.Fatal("phos not swept into the spool beside the 3fr")
+	}
+	if got := readlink(t, link); got != want {
+		t.Errorf("phos link -> %s", got)
+	}
+	raw, _ := f.env.Catalog.AssetByPath(ctx, media.Still, "2026/09/05/b0002567.3fr")
+	comps, _ := f.env.Catalog.Companions(ctx, raw.ID)
+	if len(comps) != 1 || comps[0].Ext != "phos" || comps[0].RelPath != "stills/2026/09/05/b0002567.3fr.phos" {
+		t.Errorf("companions = %+v", comps)
+	}
+	heic, _ := f.env.Catalog.AssetByPath(ctx, media.Still, "2026/09/05/b0002567.heic")
+	if c, _ := f.env.Catalog.Companions(ctx, heic.ID); len(c) != 0 {
+		t.Errorf("heic got the phos: %+v", c)
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

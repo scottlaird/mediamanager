@@ -812,6 +812,9 @@ func (e *Env) companionOwner(ctx context.Context, root, rel string) (catalog.Ass
 	dir, name := path.Split(rel)
 	base := strings.TrimSuffix(name, path.Ext(name))
 	ext := strings.ToLower(strings.TrimPrefix(path.Ext(name), "."))
+	if scan.KeepsOriginalExt(ext) {
+		base = strings.TrimSuffix(base, path.Ext(base))
+	}
 	role := catalog.RoleSidecar
 	assetDir := dir
 	if strings.EqualFold(path.Base(path.Clean(dir)), "proxy") {
@@ -852,6 +855,10 @@ func (e *Env) companionOwner(ctx context.Context, root, rel string) (catalog.Ass
 	return preferredOwner(candidates, ext), role, true, nil
 }
 
+// derived are still formats a camera writes alongside a raw; a sidecar
+// with the same base belongs to the raw.
+var derived = map[string]bool{"jpg": true, "jpeg": true, "heic": true, "heif": true}
+
 // preferredOwner picks which of several same-base originals a sidecar
 // belongs to: .sidecar goes with video, .xmp with a raw still before a
 // JPEG, and otherwise the first candidate.
@@ -861,9 +868,9 @@ func preferredOwner(cands []catalog.Asset, ext string) catalog.Asset {
 		switch {
 		case ext == "sidecar" && a.Kind == media.Video:
 			return 3
-		case ext == "xmp" && a.Kind == media.Still && aext != "jpg" && aext != "jpeg":
+		case (ext == "xmp" || ext == "phos") && a.Kind == media.Still && !derived[aext]:
 			return 3
-		case ext == "xmp" && a.Kind == media.Still:
+		case (ext == "xmp" || ext == "phos") && a.Kind == media.Still:
 			return 2
 		case a.Kind == media.Video:
 			return 1
