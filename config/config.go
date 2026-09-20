@@ -90,6 +90,28 @@ type Concurrency struct {
 	PerSource int `yaml:"per_source"`
 	// NAS is copies written to the NAS at once, system-wide. Default 3.
 	NAS int `yaml:"nas"`
+	// NASDuringImport caps NAS copies while a spool copy is running in
+	// the same process. Getting a card emptied is what has a person
+	// waiting, and archive copies compete with it for the spool disk and
+	// the worker, so while any import is spooling only this many archive
+	// copies proceed. Default 1; 0 pauses archiving until the spool copies
+	// finish; set it to NAS to disable the cap.
+	NASDuringImport *int `yaml:"nas_during_import"`
+}
+
+// NASWhileImporting returns the effective NASDuringImport, clamped to NAS.
+func (c Concurrency) NASWhileImporting() int {
+	n := 1
+	if c.NASDuringImport != nil {
+		n = *c.NASDuringImport
+	}
+	if n < 0 {
+		n = 0
+	}
+	if n > c.NAS {
+		n = c.NAS
+	}
+	return n
 }
 
 // DefaultPath is where Load looks when given no path.

@@ -75,6 +75,8 @@ temporal: {}        # defaults: localhost:7233, namespace default, task_queue me
 
 Then the usual commands start workflows and wait for them; `--detach`
 returns immediately and `--local` runs in-process regardless. Copies to
-the NAS run on their own task queue bounded by `concurrency.nas`. An
+the NAS run on their own task queue bounded by `concurrency.nas`, and
+drop to `concurrency.nas_during_import` (default 1) while a card is
+being spooled, so emptying a card is never slowed by archiving. An
 import that is interrupted resumes where it was the next time the worker
 runs; a pulled card never stops a NAS copy already under way.

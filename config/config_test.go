@@ -142,6 +142,27 @@ func TestTemporalDefaults(t *testing.T) {
 	}
 }
 
+func TestNASWhileImporting(t *testing.T) {
+	one, zero, big := 1, 0, 9
+	for _, tt := range []struct {
+		c    Concurrency
+		want int
+	}{
+		{Concurrency{NAS: 4}, 1},
+		{Concurrency{NAS: 4, NASDuringImport: &one}, 1},
+		{Concurrency{NAS: 4, NASDuringImport: &zero}, 0},
+		{Concurrency{NAS: 4, NASDuringImport: &big}, 4},
+	} {
+		if got := tt.c.NASWhileImporting(); got != tt.want {
+			t.Errorf("%+v -> %d, want %d", tt.c, got, tt.want)
+		}
+	}
+	c, err := Parse([]byte("trees: {video: {link: /v}}\nlocations: [{name: n, kind: nas, path: /n}]\nconcurrency: {nas: 4, nas_during_import: 2}"))
+	if err != nil || c.Concurrency.NASWhileImporting() != 2 {
+		t.Errorf("parsed = %d, %v", c.Concurrency.NASWhileImporting(), err)
+	}
+}
+
 func TestDefaults(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", "/data")
 	t.Setenv("XDG_CONFIG_HOME", "/conf")

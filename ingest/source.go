@@ -118,7 +118,7 @@ func (e *Env) ScanSource(ctx context.Context, root string) (*Source, error) {
 func (e *Env) sourceLocation(ctx context.Context, root string) (catalog.Location, error) {
 	l := catalog.Location{Kind: catalog.Source, Root: root}
 	if e.Identify != nil {
-		if info, err := e.Identify(root); err == nil {
+		if info, err := e.identify(root); err == nil {
 			l.VolumeUUID, l.Label = info.UUID, info.Label
 		}
 	}
@@ -223,7 +223,7 @@ func (e *Env) sourceRoots(ctx context.Context) (map[int64]string, error) {
 			continue
 		}
 		if e.Identify != nil && l.VolumeUUID != "" {
-			if info, err := e.Identify(l.Root); err != nil || info.UUID != l.VolumeUUID {
+			if info, err := e.identify(l.Root); err != nil || info.UUID != l.VolumeUUID {
 				continue
 			}
 		}

@@ -205,3 +205,33 @@ func TestChoose(t *testing.T) {
 		t.Error("chose a partial or unmounted copy")
 	}
 }
+
+func TestSet(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "links")
+	target := filepath.Join(base, "a")
+	touch(t, target)
+	changed, err := Set(root, "2026/09/05/a.braw", target)
+	if err != nil || !changed {
+		t.Fatalf("first set: %v %v", changed, err)
+	}
+	if got := readlink(t, filepath.Join(root, "2026/09/05/a.braw")); got != target {
+		t.Errorf("-> %s", got)
+	}
+	changed, err = Set(root, "2026/09/05/a.braw", target)
+	if err != nil || changed {
+		t.Errorf("idempotent set: %v %v", changed, err)
+	}
+	other := filepath.Join(base, "b")
+	touch(t, other)
+	if changed, err = Set(root, "2026/09/05/a.braw", other); err != nil || !changed {
+		t.Errorf("repoint: %v %v", changed, err)
+	}
+	touch(t, filepath.Join(root, "real.braw"))
+	if _, err := Set(root, "real.braw", target); err == nil {
+		t.Error("replaced a regular file")
+	}
+	if _, err := Set(root, "x", "relative"); err == nil {
+		t.Error("relative target accepted")
+	}
+}
