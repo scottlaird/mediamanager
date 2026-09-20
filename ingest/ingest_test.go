@@ -1338,9 +1338,22 @@ func TestVerify(t *testing.T) {
 	clip := f.relOf(t, filepath.Join(card, "A001_C001.braw"), media.Video)
 
 	// Everything intact: 3 assets x 2 mounted copies (spool, nas).
-	rep, err := f.env.Verify(ctx, refs, VerifyOptions{Full: true})
+	rep, err := f.env.Verify(ctx, refs, VerifyOptions{Full: true, Parallelism: 3})
 	if err != nil || rep.Copies != 6 || rep.OK != 6 || len(rep.Items) != 0 {
 		t.Fatalf("clean verify: %+v, %v", rep, err)
+	}
+	if rep.Parallelism != 3 || rep.BytesRead != 2*(3*mib+300*1024) || rep.Duration <= 0 {
+		t.Errorf("stats: %+v", rep)
+	}
+	byLoc := map[string]LocationStats{}
+	for _, l := range rep.Locations {
+		byLoc[l.Location] = l
+	}
+	if len(byLoc) != 2 || byLoc["fast"].Copies != 3 || byLoc["nas"].BytesRead != 3*mib+300*1024 || byLoc["nas"].MiBPerSecond <= 0 || byLoc["nas"].Kind != "nas" {
+		t.Errorf("per-location stats: %+v", rep.Locations)
+	}
+	if rep, _ = f.env.Verify(ctx, refs, VerifyOptions{}); rep.Parallelism != 4 || rep.BytesRead != 2*2*mib {
+		t.Errorf("default parallelism / sparse bytes: %+v", rep)
 	}
 
 	// A raw editor rewrites the NAS copy of one still; the NAS copy of the
@@ -1439,4 +1452,23 @@ func mustAsset(t *testing.T, f *fixture, kind media.Kind, rel string) catalog.As
 		t.Fatal(err)
 	}
 	return a
+}
+
+func TestLocAccWallIsUnionOfIntervals(t *testing.T) {
+	t0 := time.Unix(0, 0)
+	at := func(s, e float64) verifyResult {
+		return verifyResult{read: 1 << 20, start: t0.Add(time.Duration(s * float64(time.Second))), end: t0.Add(time.Duration(e * float64(time.Second)))}
+	}
+	a := &locAcc{loc: catalog.Location{Name: "nas"}}
+	// Two overlapping reads (0-2, 1-3) and one later (5-6): wall = 3 + 1 = 4 s, not 5.
+	for _, r := range []verifyResult{at(1, 3), at(0, 2), at(5, 6)} {
+		a.add(r)
+	}
+	st := a.stats()
+	if st.Wall != 4*time.Second || st.Copies != 3 || st.BytesRead != 3<<20 {
+		t.Errorf("stats = %+v", st)
+	}
+	if got := st.MiBPerSecond; got < 0.74 || got > 0.76 {
+		t.Errorf("rate = %.3f, want 0.75", got)
+	}
 }

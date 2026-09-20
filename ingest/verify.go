@@ -6,6 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/scottlaird/mediamanager/catalog"
 	"github.com/scottlaird/mediamanager/copyfile"
@@ -23,6 +27,9 @@ type VerifyOptions struct {
 	// AllowUpdates lets a changed still be adopted as the new content of
 	// its asset (see Verify). Never the default.
 	AllowUpdates bool
+	// Parallelism is how many copies are read at once; 0 means the
+	// configured concurrency.verify.
+	Parallelism int
 }
 
 // VerifyItem is one copy that did not verify, or was updated.
@@ -35,7 +42,7 @@ type VerifyItem struct {
 	Detail string
 }
 
-// VerifyReport is what Verify found.
+// VerifyReport is what Verify found, and how fast.
 type VerifyReport struct {
 	Copies   int
 	OK       int
@@ -43,6 +50,50 @@ type VerifyReport struct {
 	Mismatch int
 	Updated  int
 	Items    []VerifyItem
+	// BytesRead is what the checks read; Duration is wall time for the
+	// reading phase.
+	BytesRead   int64
+	Duration    time.Duration
+	Parallelism int
+	// Locations breaks the reading down per location, in config order.
+	Locations []LocationStats
+}
+
+// LocationStats is verify's reading on one location. Duration is the sum
+// of per-copy read times there, so with several readers it exceeds wall
+// time; MiBPerSecond is bytes over the wall time during which that
+// location was being read, which is the number to compare with a
+// network graph.
+type LocationStats struct {
+	Location     string
+	Kind         string
+	Copies       int
+	BytesRead    int64
+	Wall         time.Duration
+	MiBPerSecond float64
+}
+
+// MiBPerSecond is the aggregate read rate of the checking phase.
+func (r *VerifyReport) MiBPerSecond() float64 {
+	if r.Duration <= 0 {
+		return 0
+	}
+	return float64(r.BytesRead) / (1 << 20) / r.Duration.Seconds()
+}
+
+// verifyJob is one copy to check.
+type verifyJob struct {
+	asset catalog.Asset
+	copy  catalog.Copy
+	path  string
+}
+
+type verifyResult struct {
+	job        verifyJob
+	item       VerifyItem
+	ok         bool
+	read       int64
+	start, end time.Time
 }
 
 // Verify re-checks the mounted spool and NAS copies of the given assets
@@ -54,6 +105,9 @@ type VerifyReport struct {
 // takes the new size and hash, and the intact copies are replaced with
 // the new content. Video and audio are never updated, since their
 // identity is in the filename; a change there is reported and left.
+//
+// Copies are read Parallelism at a time; catalog updates happen after all
+// of an asset's copies have been checked.
 func (e *Env) Verify(ctx context.Context, refs []AssetRef, opts VerifyOptions) (*VerifyReport, error) {
 	e.init()
 	ps, err := e.places(ctx)
@@ -61,21 +115,29 @@ func (e *Env) Verify(ctx context.Context, refs []AssetRef, opts VerifyOptions) (
 		return nil, err
 	}
 	rootOf := e.rootOf(ps, nil)
-	rep := &VerifyReport{}
+	par := opts.Parallelism
+	if par <= 0 {
+		par = e.Config.Concurrency.Verify
+	}
+	if par <= 0 {
+		par = 1
+	}
+	rep := &VerifyReport{Parallelism: par}
+
+	// Gather the work first so progress can say how much there is.
+	var jobs []verifyJob
+	assets := map[string]catalog.Asset{}
+	var total int64
 	for _, ref := range refs {
-		if err := ctx.Err(); err != nil {
-			return rep, err
-		}
 		a, err := e.Catalog.Asset(ctx, ref.ID)
 		if err != nil {
-			return rep, err
+			return nil, err
 		}
+		assets[a.ID] = a
 		copies, err := e.Catalog.Copies(ctx, a.ID)
 		if err != nil {
-			return rep, err
+			return nil, err
 		}
-		var changed []catalog.Copy
-		var intact []catalog.Copy
 		for _, cp := range copies {
 			if cp.Location.Kind == catalog.Source || cp.State == catalog.Partial {
 				continue
@@ -87,31 +149,96 @@ func (e *Env) Verify(ctx context.Context, refs []AssetRef, opts VerifyOptions) (
 			if !mounted {
 				continue
 			}
-			rep.Copies++
-			it, ok := e.checkCopy(a, cp, abs(root, cp.RelPath), opts.Full)
-			if ok {
+			jobs = append(jobs, verifyJob{asset: a, copy: cp, path: abs(root, cp.RelPath)})
+			total += bytesToRead(a, opts.Full)
+		}
+	}
+	rep.Copies = len(jobs)
+	e.logf("verify: %d copies, %s to read, %d at a time", len(jobs), fmtBytes(total), par)
+
+	// Check in parallel; results are grouped per asset afterwards.
+	start := time.Now()
+	in := make(chan verifyJob)
+	out := make(chan verifyResult, par)
+	var wg sync.WaitGroup
+	for i := 0; i < par; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range in {
+				t0 := time.Now()
+				it, ok := e.checkCopy(j.asset, j.copy, j.path, opts.Full)
+				out <- verifyResult{job: j, item: it, ok: ok, read: bytesToRead(j.asset, opts.Full), start: t0, end: time.Now()}
+			}
+		}()
+	}
+	go func() {
+		defer close(in)
+		for _, j := range jobs {
+			select {
+			case in <- j:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	go func() { wg.Wait(); close(out) }()
+
+	byAsset := map[string][]verifyResult{}
+	var done, read atomic.Int64
+	prog := newProgress(e.Logf, "verify", 0)
+	perLoc := map[int64]*locAcc{}
+	for r := range out {
+		byAsset[r.job.asset.ID] = append(byAsset[r.job.asset.ID], r)
+		done.Add(1)
+		read.Add(r.read)
+		prog.report(read.Load(), total)
+		acc := perLoc[r.job.copy.LocationID]
+		if acc == nil {
+			acc = &locAcc{loc: r.job.copy.Location}
+			perLoc[r.job.copy.LocationID] = acc
+		}
+		acc.add(r)
+	}
+	if err := ctx.Err(); err != nil {
+		return rep, err
+	}
+	rep.Duration = time.Since(start)
+	rep.BytesRead = read.Load()
+	for _, p := range ps {
+		if acc := perLoc[p.cat.ID]; acc != nil {
+			rep.Locations = append(rep.Locations, acc.stats())
+		}
+	}
+
+	// Apply findings per asset, in a stable order.
+	for _, ref := range refs {
+		results := byAsset[ref.ID]
+		if len(results) == 0 {
+			continue
+		}
+		a := assets[ref.ID]
+		var changed, intact []catalog.Copy
+		for _, r := range results {
+			cp := r.job.copy
+			if r.ok {
 				rep.OK++
 				intact = append(intact, cp)
-				if cp.State != catalog.Complete {
-					// A copy previously marked mismatched that now matches
-					// (restored by hand) is complete again.
-					_ = e.Catalog.SetCopyState(ctx, a.ID, cp.LocationID, catalog.Complete)
-				} else {
-					_ = e.Catalog.SetCopyState(ctx, a.ID, cp.LocationID, catalog.Complete) // stamps verified_at
+				// Stamps verified_at; also restores a copy fixed by hand.
+				if err := e.Catalog.SetCopyState(ctx, a.ID, cp.LocationID, catalog.Complete); err != nil {
+					return rep, err
 				}
 				continue
 			}
-			if it.Result == "missing" {
+			if r.item.Result == "missing" {
 				rep.Missing++
 			} else {
 				rep.Mismatch++
+				changed = append(changed, cp)
 			}
-			rep.Items = append(rep.Items, it)
+			rep.Items = append(rep.Items, r.item)
 			if err := e.Catalog.SetCopyState(ctx, a.ID, cp.LocationID, catalog.Mismatch); err != nil {
 				return rep, err
-			}
-			if it.Result != "missing" {
-				changed = append(changed, cp)
 			}
 		}
 		if opts.AllowUpdates && len(changed) == 1 && len(intact) > 0 {
@@ -125,7 +252,68 @@ func (e *Env) Verify(ctx context.Context, refs []AssetRef, opts VerifyOptions) (
 			return rep, err
 		}
 	}
+	e.logf("verify: %d copies in %s, %s read at %.0f MiB/s", rep.Copies, rep.Duration.Round(time.Second), fmtBytes(rep.BytesRead), rep.MiBPerSecond())
+	for _, l := range rep.Locations {
+		e.logf("  %s (%s): %d copies, %s at %.0f MiB/s", l.Location, l.Kind, l.Copies, fmtBytes(l.BytesRead), l.MiBPerSecond)
+	}
 	return rep, nil
+}
+
+// locAcc accumulates verify reads on one location. Wall time is the union
+// of the per-copy read intervals, so overlapping readers are not double
+// counted and idle stretches (while other locations were being read) do
+// not dilute the rate.
+type locAcc struct {
+	loc       catalog.Location
+	copies    int
+	bytes     int64
+	intervals [][2]time.Time
+}
+
+func (a *locAcc) add(r verifyResult) {
+	a.copies++
+	a.bytes += r.read
+	a.intervals = append(a.intervals, [2]time.Time{r.start, r.end})
+}
+
+func (a *locAcc) stats() LocationStats {
+	sort.Slice(a.intervals, func(i, j int) bool { return a.intervals[i][0].Before(a.intervals[j][0]) })
+	var wall time.Duration
+	var cur [2]time.Time
+	for i, iv := range a.intervals {
+		if i == 0 || iv[0].After(cur[1]) {
+			if i > 0 {
+				wall += cur[1].Sub(cur[0])
+			}
+			cur = iv
+			continue
+		}
+		if iv[1].After(cur[1]) {
+			cur[1] = iv[1]
+		}
+	}
+	if len(a.intervals) > 0 {
+		wall += cur[1].Sub(cur[0])
+	}
+	st := LocationStats{Location: a.loc.Name, Kind: string(a.loc.Kind), Copies: a.copies, BytesRead: a.bytes, Wall: wall}
+	if wall > 0 {
+		st.MiBPerSecond = float64(a.bytes) / (1 << 20) / wall.Seconds()
+	}
+	return st
+}
+
+// bytesToRead is what checking one copy costs: the whole file with Full,
+// otherwise the two 1 MiB extents of the sparse identity for video and
+// audio and nothing (a stat) for stills.
+func bytesToRead(a catalog.Asset, full bool) int64 {
+	switch {
+	case full:
+		return a.Size
+	case a.Kind.UsesSparseID():
+		return min(a.Size, 2*identity.Chunk)
+	default:
+		return 0
+	}
 }
 
 // checkCopy compares one file with the catalog. ok is true when it matches.

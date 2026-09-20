@@ -622,6 +622,7 @@ func verifyCmd() *cobra.Command {
 		full         bool
 		location     string
 		allowUpdates bool
+		parallelism  int
 	)
 	cmd := &cobra.Command{
 		Use:   "verify [path-prefix|asset-id]...",
@@ -656,7 +657,7 @@ you to restore by hand from an intact copy.`,
 			} else if refs, err = env.Select(cmd.Context(), args); err != nil {
 				return err
 			}
-			rep, err := env.Verify(cmd.Context(), refs, ingest.VerifyOptions{Full: full, Location: location, AllowUpdates: allowUpdates})
+			rep, err := env.Verify(cmd.Context(), refs, ingest.VerifyOptions{Full: full, Location: location, AllowUpdates: allowUpdates, Parallelism: parallelism})
 			if rep != nil {
 				tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
 				for _, it := range rep.Items {
@@ -664,6 +665,10 @@ you to restore by hand from an intact copy.`,
 				}
 				tw.Flush()
 				fmt.Printf("%d copies checked: %d ok, %d missing, %d mismatched, %d updated\n", rep.Copies, rep.OK, rep.Missing, rep.Mismatch, rep.Updated)
+				fmt.Printf("%s read in %s at %.0f MiB/s, %d at a time\n", humanSize(rep.BytesRead), rep.Duration.Round(time.Second), rep.MiBPerSecond(), rep.Parallelism)
+				for _, l := range rep.Locations {
+					fmt.Printf("  %-12s %-6s %6d copies  %10s at %.0f MiB/s\n", l.Location, l.Kind, l.Copies, humanSize(l.BytesRead), l.MiBPerSecond)
+				}
 				if (rep.Missing > 0 || rep.Mismatch > 0) && !allowUpdates {
 					fmt.Println("mismatched copies are excluded from links and flush until restored; verify again after fixing them")
 				}
@@ -680,5 +685,6 @@ you to restore by hand from an intact copy.`,
 	cmd.Flags().BoolVar(&full, "full", false, "re-hash every byte (slow) instead of size and sparse identity")
 	cmd.Flags().StringVar(&location, "location", "", "check only copies on this location")
 	cmd.Flags().BoolVar(&allowUpdates, "allow-updates", false, "adopt an edited still as the new content and update its other copies")
+	cmd.Flags().IntVarP(&parallelism, "parallelism", "p", 0, "copies to read at once (default: concurrency.verify, 4)")
 	return cmd
 }
