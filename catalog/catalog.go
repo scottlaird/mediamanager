@@ -26,7 +26,7 @@ import (
 var schema string
 
 // schemaVersion is stored in PRAGMA user_version. Bump it with any migration.
-const schemaVersion = 2
+const schemaVersion = 3
 
 var (
 	ErrNotFound = errors.New("catalog: not found")
@@ -84,6 +84,26 @@ func (c *DB) migrate(ctx context.Context) error {
 	}
 	if _, err := c.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("catalog: creating schema: %w", err)
+	}
+	if v == 2 {
+		// v3 adds the 'mismatch' copy state; SQLite cannot widen a CHECK in
+		// place, so the table is rebuilt.
+		if _, err := c.db.ExecContext(ctx, `
+			CREATE TABLE copies_v3 (
+			    asset_id    TEXT    NOT NULL REFERENCES assets(id),
+			    location_id INTEGER NOT NULL REFERENCES locations(id),
+			    relpath     TEXT    NOT NULL,
+			    state       TEXT    NOT NULL CHECK (state IN ('partial', 'complete', 'mismatch')),
+			    verified_at TEXT    NOT NULL DEFAULT '',
+			    full_sha256 TEXT    NOT NULL DEFAULT '',
+			    PRIMARY KEY (asset_id, location_id)
+			);
+			INSERT INTO copies_v3 SELECT asset_id, location_id, relpath, state, verified_at, full_sha256 FROM copies;
+			DROP TABLE copies;
+			ALTER TABLE copies_v3 RENAME TO copies;
+			CREATE INDEX IF NOT EXISTS copies_by_location ON copies (location_id, state);`); err != nil {
+			return fmt.Errorf("catalog: migrating copies to v3: %w", err)
+		}
 	}
 	if v < schemaVersion {
 		if _, err := c.db.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
@@ -229,6 +249,25 @@ func (c *DB) AssetByPath(ctx context.Context, kind media.Kind, relpath string) (
 		`SELECT `+assetCols+` FROM assets WHERE kind = ? AND relpath = ?`, kind.String(), relpath))
 }
 
+// SetCopyState changes one copy's state and stamps verified_at when the
+// state is Complete.
+func (c *DB) SetCopyState(ctx context.Context, assetID string, locationID int64, state CopyState) error {
+	verified := ""
+	if state == Complete {
+		verified = formatTime(time.Now())
+	}
+	return c.update(ctx, `UPDATE copies SET state = ?, verified_at = ? WHERE asset_id = ? AND location_id = ?`,
+		state, verified, assetID, locationID)
+}
+
+// SetAssetContent records that an asset's content changed on disk: its
+// size and full hash. The ID is left alone so every reference to the
+// asset survives; for stills, whose ID was the original hash, ID and
+// FullSHA256 then differ, which is how an edited original is recognised.
+func (c *DB) SetAssetContent(ctx context.Context, id string, size int64, fullSHA256 string) error {
+	return c.update(ctx, `UPDATE assets SET size = ?, full_sha256 = ? WHERE id = ?`, size, fullSHA256, id)
+}
+
 // SetFullSHA256 records a full hash learned later, typically from a copy.
 func (c *DB) SetFullSHA256(ctx context.Context, id, sum string) error {
 	return c.update(ctx, `UPDATE assets SET full_sha256 = ? WHERE id = ?`, sum, id)
@@ -277,6 +316,10 @@ type CopyState string
 const (
 	Partial  CopyState = "partial"
 	Complete CopyState = "complete"
+	// Mismatch is a copy that verify found different from the catalog:
+	// wrong size or identity, or missing. It is never linked to, never
+	// counts as a safe copy, and is never deleted by the tool.
+	Mismatch CopyState = "mismatch"
 )
 
 // Copy is one asset on one location.

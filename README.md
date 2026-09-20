@@ -44,6 +44,7 @@ mounts a second disk with the same name as `/Volumes/Name 1`.
     mm status --assets                 # where everything is
     mm flush fast --free 2T            # free spool space, oldest first
     mm spool 2026/07/10 --pin          # bring a day back from the NAS, keep it
+    mm verify 2026/09 --full           # re-check copies against the catalog; report only
     mm relink                          # repoint links after mounts change
     mm archive                         # finish any NAS copies left over
 

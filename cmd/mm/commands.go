@@ -616,3 +616,69 @@ by path prefix (2026/07/10) or by kind/path prefix (video/2026). With
 	cmd.Flags().BoolVar(&local, "local", false, "run in-process even if temporal is configured")
 	return cmd
 }
+
+func verifyCmd() *cobra.Command {
+	var (
+		full         bool
+		location     string
+		allowUpdates bool
+	)
+	cmd := &cobra.Command{
+		Use:   "verify [path-prefix|asset-id]...",
+		Short: "Re-check spool and NAS copies against the catalog",
+		Long: `Verify re-reads the mounted spool and NAS copies of the selected assets
+(everything, with no selector) and compares them with the catalog: size and
+sparse identity for video and audio, size for stills, and the full hash
+with --full. A copy that no longer matches is marked as a mismatch: the
+link tree stops pointing at it, flush stops counting it as a safe copy, and
+nothing deletes it. Nothing on disk changes.
+
+With --allow-updates, a still with exactly one changed copy and the rest
+intact is treated as edited in place (a raw editor rewriting a file): the
+catalog takes the new content and the intact copies are replaced with it.
+Video and audio are never updated; a change there is reported and left for
+you to restore by hand from an intact copy.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			env, done, err := openEnv()
+			if err != nil {
+				return err
+			}
+			defer done()
+			var refs []ingest.AssetRef
+			if len(args) == 0 {
+				all, err := env.List(cmd.Context(), ingest.ListOptions{})
+				if err != nil {
+					return err
+				}
+				for _, a := range all {
+					refs = append(refs, ingest.RefOf(a.Asset))
+				}
+			} else if refs, err = env.Select(cmd.Context(), args); err != nil {
+				return err
+			}
+			rep, err := env.Verify(cmd.Context(), refs, ingest.VerifyOptions{Full: full, Location: location, AllowUpdates: allowUpdates})
+			if rep != nil {
+				tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+				for _, it := range rep.Items {
+					fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", it.Result, it.Location, it.Path, it.Detail)
+				}
+				tw.Flush()
+				fmt.Printf("%d copies checked: %d ok, %d missing, %d mismatched, %d updated\n", rep.Copies, rep.OK, rep.Missing, rep.Mismatch, rep.Updated)
+				if (rep.Missing > 0 || rep.Mismatch > 0) && !allowUpdates {
+					fmt.Println("mismatched copies are excluded from links and flush until restored; verify again after fixing them")
+				}
+			}
+			if err != nil {
+				return err
+			}
+			if rep.Missing > 0 || rep.Mismatch > rep.Updated {
+				return errors.New("verify found problems")
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&full, "full", false, "re-hash every byte (slow) instead of size and sparse identity")
+	cmd.Flags().StringVar(&location, "location", "", "check only copies on this location")
+	cmd.Flags().BoolVar(&allowUpdates, "allow-updates", false, "adopt an edited still as the new content and update its other copies")
+	return cmd
+}

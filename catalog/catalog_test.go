@@ -66,6 +66,40 @@ func TestOpenIsIdempotentAndPersists(t *testing.T) {
 	}
 }
 
+func TestMismatchState(t *testing.T) {
+	c := open(t)
+	nas := loc(t, c, NAS, "nas", 0)
+	a := video("3f9a1c2e7b4d5a60", "a.braw", shot)
+	c.PutAsset(ctx, a)
+	c.PutCopy(ctx, Copy{AssetID: a.ID, LocationID: nas.ID, RelPath: "a.braw", State: Complete})
+	if err := c.SetCopyState(ctx, a.ID, nas.ID, Mismatch); err != nil {
+		t.Fatal(err)
+	}
+	cps, _ := c.Copies(ctx, a.ID)
+	if len(cps) != 1 || cps[0].State != Mismatch || !cps[0].VerifiedAt.IsZero() {
+		t.Errorf("copies = %+v", cps)
+	}
+	// A mismatched NAS copy is not an archive: the asset needs one.
+	na, _ := c.NeedsArchive(ctx)
+	if len(na) != 0 { // no complete copy anywhere, so not in the worklist either
+		t.Errorf("NeedsArchive = %v", na)
+	}
+	if err := c.SetCopyState(ctx, a.ID, nas.ID, Complete); err != nil {
+		t.Fatal(err)
+	}
+	cps, _ = c.Copies(ctx, a.ID)
+	if cps[0].VerifiedAt.IsZero() {
+		t.Error("verified_at not stamped")
+	}
+	if err := c.SetAssetContent(ctx, a.ID, 42, "deadbeef"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := c.Asset(ctx, a.ID)
+	if got.Size != 42 || got.FullSHA256 != "deadbeef" || got.ID != a.ID {
+		t.Errorf("after SetAssetContent: %+v", got)
+	}
+}
+
 func TestPutAsset(t *testing.T) {
 	c := open(t)
 	a := video("3f9a1c2e7b4d5a60", "2026/09/05/a001-3f9a1c2e7b4d5a60.braw", shot)
