@@ -195,7 +195,7 @@ func TestDefaults(t *testing.T) {
 	if c.Catalog != "/data/mediamanager/catalog.db" {
 		t.Errorf("catalog = %q", c.Catalog)
 	}
-	if c.Timezone != "Local" || c.Concurrency.PerSource != 1 || c.Concurrency.NAS != 3 {
+	if c.Timezone != "Local" || c.Concurrency.PerSource != 1 || c.Concurrency.NAS != 3 || c.Concurrency.Verify != 4 {
 		t.Errorf("defaults = %+v", c)
 	}
 	if DefaultPath() != "/conf/mediamanager/config.yaml" {

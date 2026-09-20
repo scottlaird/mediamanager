@@ -116,6 +116,9 @@ type Concurrency struct {
 	// copies proceed. Default 1; 0 pauses archiving until the spool copies
 	// finish; set it to NAS to disable the cap.
 	NASDuringImport *int `yaml:"nas_during_import"`
+	// Verify is how many copies mm verify checks at once. Default 4: one
+	// SMB stream reads at a quarter of what several do.
+	Verify int `yaml:"verify"`
 }
 
 // NASWhileImporting returns the effective NASDuringImport, clamped to NAS.
@@ -191,6 +194,9 @@ func (c *Config) finish() error {
 	}
 	if c.Concurrency.NAS <= 0 {
 		c.Concurrency.NAS = 3
+	}
+	if c.Concurrency.Verify <= 0 {
+		c.Concurrency.Verify = 4
 	}
 	if len(c.Extensions.Video) == 0 {
 		c.Extensions.Video = scan.DefaultVideoExts
