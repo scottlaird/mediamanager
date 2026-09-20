@@ -212,7 +212,7 @@ func archiveCmd() *cobra.Command {
 				for _, f := range res.Failures {
 					fmt.Printf("  FAILED %s\n", f)
 				}
-				if len(res.Failures) > 0 {
+				if res.Failed > 0 {
 					return errors.New("archive finished with errors")
 				}
 				return nil
@@ -592,7 +592,7 @@ by path prefix (2026/07/10) or by kind/path prefix (video/2026). With
 				for _, f := range res.Failures {
 					fmt.Printf("  FAILED %s\n", f)
 				}
-				if len(res.Failures) > 0 {
+				if res.Failed > 0 {
 					return errors.New("spool finished with errors")
 				}
 				return nil

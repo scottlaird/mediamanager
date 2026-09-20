@@ -20,6 +20,7 @@ import (
 	"go.temporal.io/sdk/log"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
+	"go.temporal.io/sdk/workflow"
 )
 
 const mib = 1 << 20
@@ -99,11 +100,15 @@ func quietSuite() *testsuite.WorkflowTestSuite {
 func newEnv(t *testing.T, f *fixture) *testsuite.TestWorkflowEnvironment {
 	t.Helper()
 	env := quietSuite().NewTestWorkflowEnvironment()
+	// Activities run for real against temp dirs; the SDK's 3 s default is
+	// wall-clock and too tight for the batching tests on a slow runner.
+	env.SetTestTimeout(5 * time.Minute)
 	env.RegisterWorkflow(ImportSource)
 	env.RegisterWorkflow(ArchiveAsset)
 	env.RegisterWorkflow(ArchiveBacklog)
 	env.RegisterWorkflow(FlushSpool)
 	env.RegisterWorkflow(SpoolAssets)
+	env.RegisterWorkflow(ArchiveBatch)
 	env.RegisterActivity(&Activities{Env: f.env})
 	return env
 }
@@ -214,6 +219,7 @@ func TestSpoolActivityHeartbeats(t *testing.T) {
 		t.Fatal(err)
 	}
 	env := quietSuite().NewTestActivityEnvironment()
+	env.SetTestTimeout(5 * time.Minute)
 	acts := &Activities{Env: f.env}
 	env.RegisterActivity(acts)
 	var beats int
@@ -304,6 +310,64 @@ func TestSpoolAssetsWorkflow(t *testing.T) {
 	env.GetWorkflowResult(&res)
 	if res.Skipped != 2 || res.Spooled != 0 {
 		t.Errorf("second spool %+v", res)
+	}
+}
+
+func TestImportManySmallFilesGoesThroughBatches(t *testing.T) {
+	f := newFixture(t, true)
+	// 130 small stills: 3 batches of 50/50/30, no per-file workflows.
+	f.env.Config.Trees["still"] = config.Tree{Subdir: "stills", Link: filepath.Join(f.links, "still")}
+	files := map[string]int{}
+	for i := 0; i < 130; i++ {
+		files[fmt.Sprintf("DCIM/100HASBL/B%07d.3FR", i)] = 4096 + i
+	}
+	card := f.card(t, files)
+	env := newEnv(t, f)
+	var batchSpools, perFileSpools, batchChildren, perFileChildren int
+	env.SetOnActivityStartedListener(func(info *activity.Info, ctx context.Context, args converter.EncodedValues) {
+		switch info.ActivityType.Name {
+		case "SpoolBatch":
+			batchSpools++
+		case "Spool":
+			perFileSpools++
+		}
+	})
+	env.SetOnChildWorkflowStartedListener(func(info *workflow.Info, ctx workflow.Context, args converter.EncodedValues) {
+		switch info.WorkflowType.Name {
+		case "ArchiveBatch":
+			batchChildren++
+		case "ArchiveAsset":
+			perFileChildren++
+		}
+	})
+	env.ExecuteWorkflow(ImportSource, card, QueuesFor("t"))
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatal(err)
+	}
+	var res ImportResult
+	env.GetWorkflowResult(&res)
+	if res.Assets != 130 || res.Spooled != 130 || res.Archived != 130 || res.Failed != 0 || !res.SafeToFormat {
+		t.Fatalf("result %+v", res)
+	}
+	if batchSpools != 3 || batchChildren != 3 || perFileSpools != 0 || perFileChildren != 0 {
+		t.Errorf("batches: spool=%d archive=%d; per-file: spool=%d archive=%d", batchSpools, batchChildren, perFileSpools, perFileChildren)
+	}
+	// A large file on the same card still gets its own workflow.
+	os.WriteFile(filepath.Join(card, "DCIM/100HASBL/A001_C001.braw"), make([]byte, batchBelow+1), 0o644) // DCIM card: only DCIM/ is scanned
+	env = newEnv(t, f)
+	perFileChildren = 0
+	env.SetOnChildWorkflowStartedListener(func(info *workflow.Info, ctx workflow.Context, args converter.EncodedValues) {
+		if info.WorkflowType.Name == "ArchiveAsset" {
+			perFileChildren++
+		}
+	})
+	env.ExecuteWorkflow(ImportSource, card, QueuesFor("t"))
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatal(err)
+	}
+	env.GetWorkflowResult(&res)
+	if res.Assets != 131 || res.Spooled != 1 || perFileChildren != 1 || !res.SafeToFormat {
+		t.Errorf("with a large file: %+v, per-file children %d", res, perFileChildren)
 	}
 }
 

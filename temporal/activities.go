@@ -4,6 +4,10 @@
 // holds only in-flight state: which assets are mid-copy, what to retry,
 // what to wait for. Every activity is one ingest step, idempotent and
 // resumable on its own, so a retry after a crash costs at most one buffer.
+//
+// Payloads are kept small on purpose: activities exchange asset IDs and
+// short refs, never file listings, because Temporal caps a payload at 2 MiB
+// and a card can hold thousands of files.
 package temporal
 
 import (
@@ -36,14 +40,34 @@ func (a *Activities) Relink(ctx context.Context) error {
 	return err
 }
 
-// ScanSource registers everything on a mounted source without copying.
-func (a *Activities) ScanSource(ctx context.Context, root string) (*ingest.Source, error) {
-	return a.Env.ScanSource(ctx, root)
+// ScanSource registers everything on a mounted source without copying,
+// and returns IDs and counts rather than the listing.
+func (a *Activities) ScanSource(ctx context.Context, root string) (*ingest.ScanSummary, error) {
+	src, err := a.Env.ScanSource(ctx, root)
+	if err != nil {
+		return nil, err
+	}
+	return src.Summary(), nil
+}
+
+// Refs describes a page of assets by ID.
+func (a *Activities) Refs(ctx context.Context, ids []string) ([]ingest.AssetRef, error) {
+	return a.Env.Refs(ctx, ids)
 }
 
 // IsArchived reports whether the asset has a complete copy on a mounted NAS.
 func (a *Activities) IsArchived(ctx context.Context, id string) (bool, error) {
 	return a.Env.IsArchived(ctx, id)
+}
+
+// AllArchivedOn reports whether every asset on a source is on a mounted NAS.
+func (a *Activities) AllArchivedOn(ctx context.Context, source string) (bool, error) {
+	return a.Env.AllArchivedOn(ctx, source)
+}
+
+// SourceAssetIDs pages the assets registered on a source.
+func (a *Activities) SourceAssetIDs(ctx context.Context, source string, offset, limit int) ([]string, error) {
+	return a.Env.SourceAssetIDs(ctx, source, offset, limit)
 }
 
 // Spool copies one asset to a spool, heartbeating as bytes move.
@@ -60,6 +84,19 @@ func (a *Activities) Archive(ctx context.Context, ref ingest.AssetRef) ([]ingest
 	return r, classify(err)
 }
 
+// SpoolBatch spools a list of small assets in one activity, heartbeating
+// per item, so a card of thousands of photos costs a few dozen activities
+// rather than thousands. Per-item failures are in the result.
+func (a *Activities) SpoolBatch(ctx context.Context, refs []ingest.AssetRef) ([]ingest.BatchItem, error) {
+	return a.Env.SpoolBatch(batchHeartbeating(ctx), refs)
+}
+
+// ArchiveBatch archives a list of small assets in one activity on the NAS
+// queue; one batch holds one NAS slot.
+func (a *Activities) ArchiveBatch(ctx context.Context, refs []ingest.AssetRef) ([]ingest.BatchItem, error) {
+	return a.Env.ArchiveBatch(batchHeartbeating(ctx), refs)
+}
+
 // Pin marks assets to be kept through flushes.
 func (a *Activities) Pin(ctx context.Context, ids []string, pinned bool) error {
 	for _, id := range ids {
@@ -70,9 +107,9 @@ func (a *Activities) Pin(ctx context.Context, ids []string, pinned bool) error {
 	return nil
 }
 
-// NeedsArchive lists assets lacking a NAS copy.
-func (a *Activities) NeedsArchive(ctx context.Context) ([]ingest.AssetRef, error) {
-	return a.Env.NeedsArchiveRefs(ctx)
+// NeedsArchive pages the IDs of assets lacking a NAS copy.
+func (a *Activities) NeedsArchive(ctx context.Context, offset, limit int) ([]string, error) {
+	return a.Env.NeedsArchivePage(ctx, offset, limit)
 }
 
 // Flush evicts verified spool copies.
@@ -81,12 +118,15 @@ func (a *Activities) Flush(ctx context.Context, spool string, opts ingest.FlushO
 }
 
 // Heartbeat is what a copy activity reports as it runs; it shows in the
-// UI as the pending activity's heartbeat details.
+// UI as the pending activity's heartbeat details. Index and Count are set
+// by batch activities.
 type Heartbeat struct {
 	Path    string
 	Done    int64
 	Total   int64
 	Percent int
+	Index   int
+	Count   int
 }
 
 // heartbeating forwards copy progress to Temporal so a stalled copy is
@@ -95,6 +135,13 @@ type Heartbeat struct {
 func heartbeating(ctx context.Context, ref ingest.AssetRef) context.Context {
 	return ingest.WithProgress(ctx, func(done, total int64) {
 		activity.RecordHeartbeat(ctx, Heartbeat{Path: ref.Path, Done: done, Total: total, Percent: int(done * 100 / max(total, 1))})
+	})
+}
+
+func batchHeartbeating(ctx context.Context) context.Context {
+	return ingest.WithBatchProgress(ctx, func(p ingest.BatchProgress) {
+		activity.RecordHeartbeat(ctx, Heartbeat{Path: p.Ref.Path, Done: p.Done, Total: p.Total,
+			Percent: int(p.Done * 100 / max(p.Total, 1)), Index: p.Index + 1, Count: p.Count})
 	})
 }
 

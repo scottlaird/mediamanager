@@ -28,6 +28,37 @@ func RefOf(a catalog.Asset) AssetRef {
 	return AssetRef{ID: a.ID, Path: a.Kind.String() + "/" + a.RelPath, Size: a.Size}
 }
 
+// ScanSummary is Source reduced to what travels well: counts, with a few
+// examples of anything that was skipped. Asset IDs are fetched afterwards
+// in pages by source, so its size does not grow with the card.
+type ScanSummary struct {
+	Source                          string
+	Shape                           string
+	Assets                          int
+	New                             int
+	Unrouted, Orphans, Unrecognised int
+	// Examples holds up to Examples entries from each of the skipped lists.
+	Examples []string
+}
+
+// MaxExamples bounds the skipped-file examples carried in a ScanSummary.
+const MaxExamples = 20
+
+// Summary reduces a Source for transport.
+func (s *Source) Summary() *ScanSummary {
+	sum := &ScanSummary{Source: s.Loc.Name, Shape: s.Shape.String(), Assets: len(s.Assets), New: len(s.New),
+		Unrouted: len(s.Unrouted), Orphans: len(s.Orphans), Unrecognised: len(s.Unrecognised)}
+	for _, list := range [][]string{s.Unrouted, s.Orphans, s.Unrecognised} {
+		for i, rel := range list {
+			if i >= MaxExamples {
+				break
+			}
+			sum.Examples = append(sum.Examples, rel)
+		}
+	}
+	return sum
+}
+
 // Source is the outcome of scanning one mounted source.
 type Source struct {
 	Loc   catalog.Location
