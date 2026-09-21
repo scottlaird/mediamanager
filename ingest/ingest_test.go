@@ -1525,6 +1525,26 @@ func TestVerifyFullWithoutReferenceHash(t *testing.T) {
 	if got := mustAsset(t, f, media.Video, clip).FullSHA256; got != "" {
 		t.Errorf("hash recorded despite conflict: %s", got)
 	}
+
+	// A lone copy yields a baseline, not agreement.
+	lone := mkCard(t, f.base, "card2", map[string]int{"B001_C001.braw": mib}, 122)
+	os.RemoveAll(f.spool)
+	os.MkdirAll(f.spool, 0o755)
+	if _, err := f.env.Import(ctx, lone); err != nil {
+		t.Fatal(err)
+	}
+	lb := mustAsset(t, f, media.Video, f.relOf(t, filepath.Join(lone, "B001_C001.braw"), media.Video))
+	f.env.Catalog.SetFullSHA256(ctx, lb.ID, "")
+	if _, err := f.env.FlushSpool(ctx, "fast", FlushOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	rep, _ = f.env.Verify(ctx, []AssetRef{RefOf(lb)}, VerifyOptions{Full: true})
+	if rep.OK != 1 || len(rep.Items) != 1 || rep.Items[0].Result != "baseline" {
+		t.Errorf("lone copy: %+v", rep)
+	}
+	if mustAsset(t, f, media.Video, lb.RelPath).FullSHA256 == "" {
+		t.Error("baseline not recorded")
+	}
 }
 
 func mustLoc(t *testing.T, f *fixture, name string) catalog.Location {

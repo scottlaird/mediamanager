@@ -36,8 +36,9 @@ type VerifyOptions struct {
 type VerifyItem struct {
 	Path     string
 	Location string
-	// Result is one of: missing, size, identity, hash, conflict, recorded,
-	// updated, replaced, unresolved.
+	// Result is one of: missing, size, identity, hash, conflict, recorded
+	// (hash agreed by several copies), baseline (hash taken from a single
+	// copy), updated, replaced, unresolved.
 	Result string
 	Detail string
 }
@@ -269,8 +270,16 @@ func (e *Env) Verify(ctx context.Context, refs []AssetRef, opts VerifyOptions) (
 							_ = e.Catalog.PutCopy(ctx, withHash(results[i].job.copy, h))
 						}
 					}
-					rep.Items = append(rep.Items, VerifyItem{Path: a.Kind.String() + "/" + a.RelPath, Location: "*",
-						Result: "recorded", Detail: fmt.Sprintf("full hash %s… recorded from %d agreeing copies", h[:16], hashes[h])})
+					it := VerifyItem{Path: a.Kind.String() + "/" + a.RelPath, Location: "*", Result: "recorded",
+						Detail: fmt.Sprintf("full hash %s… recorded; %d copies agree", h[:16], hashes[h])}
+					if hashes[h] == 1 {
+						// One copy cannot vouch for itself: the hash is a
+						// baseline for catching future change, not proof the
+						// content is right.
+						it.Result = "baseline"
+						it.Detail = fmt.Sprintf("full hash %s… recorded from the only copy; future changes will be caught, but nothing has confirmed this content", h[:16])
+					}
+					rep.Items = append(rep.Items, it)
 				}
 			default:
 				if len(hashes) > 1 {
